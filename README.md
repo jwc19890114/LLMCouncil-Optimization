@@ -2,17 +2,33 @@
 
 ![llmcouncil](header.jpg)
 
-The idea of this repo is that instead of asking a question to your favorite LLM provider (e.g. OpenAI GPT 5.1, Google Gemini 3.0 Pro, Anthropic Claude Sonnet 4.5, xAI Grok 4, eg.c), you can group them into your "LLM Council". This repo is a simple, local web app that essentially looks like ChatGPT except it uses OpenRouter to send your query to multiple LLMs, it then asks them to review and rank each other's work, and finally a Chairman LLM produces the final response.
+> 本仓库基于原始项目 `karpathy/llm-council`，并针对“数据分析/知识库/图谱/可长期迭代”的目标做了增强与优化。
 
-In a bit more detail, here is what happens when you submit a query:
+## 项目简介（原始简介中文翻译）
 
-1. **Stage 1: First opinions**. The user query is given to all LLMs individually, and the responses are collected. The individual responses are shown in a "tab view", so that the user can inspect them all one by one.
-2. **Stage 2: Review**. Each individual LLM is given the responses of the other LLMs. Under the hood, the LLM identities are anonymized so that the LLM can't play favorites when judging their outputs. The LLM is asked to rank them in accuracy and insight.
-3. **Stage 3: Final response**. The designated Chairman of the LLM Council takes all of the model's responses and compiles them into a single final answer that is presented to the user.
+这个仓库的想法是：与其只向你最喜欢的 LLM 提一个问题（例如 OpenAI、Google Gemini、Anthropic Claude、xAI Grok 等），不如把它们组成一个“LLM 委员会”。本项目是一个本地 Web 应用，界面类似 ChatGPT，但它会通过 OpenRouter（以及其它兼容 Provider）把你的问题同时发给多个模型，让它们互相评审并排序，最后由“主席（Chairman）”模型综合生成最终答案。
 
-## Vibe Code Alert
+更具体一点，当你提交问题时会发生：
 
-This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.
+1. **阶段 1：初稿**：把用户问题分别发给所有模型并收集回答。前端用“Tab 视图”展示每个专家的独立回答，便于逐个查看。
+2. **阶段 2：互评**：把其它专家的回答发给每个模型，并对身份做匿名化（避免偏袒），让模型从准确性与洞察等维度进行评审并给出排序。
+3. **阶段 3：定稿**：由指定的主席模型综合所有回答与互评结果，输出最终结论。
+
+## Vibe Code Alert（原作者声明中文翻译）
+
+该项目最初是作者在一个周六“图一乐”的 99% vibe coding 作品，用于在“和 LLM 一起读书”的过程中并排对比多个模型的效果。并排查看多个回答、以及模型之间对彼此输出的交叉评价很有趣也很实用。作者不打算维护该项目，它按现状提供，仅供启发；想改什么就让你的 LLM 去改。
+
+## 本仓库的增强（LLMCouncil-Optimization）
+
+面向“可长期用于数据分析”的目标，本仓库在原始项目基础上做了增强（下面是最重要的变化点；更完整的模块说明见 `ARCHITECTURE.md`）：
+
+- **Agent 管理增强**：前端可新增/编辑/删除 Agent，支持人设（system prompt）、权重/年资、启用/停用；支持自动生成人设。
+- **会话级配置**：每个会话可选择参与专家子集；可在会话内按 **Agent 名称** 下拉选择 Chairman（仅影响阶段 3 综合）。
+- **文本数据上传与解读**：聊天页支持上传文本文件 → 写入知识库 → 绑定到当前会话；阶段 1 注入时优先使用会话附件做检索与上下文。
+- **知识库（SQLite）**：`data/kb.sqlite`，支持 FTS/语义/Hybrid 检索与可选 rerank；支持分类与按专家范围过滤。
+- **知识图谱（Neo4j）**：图谱创建/抽取/可视化/节点解读与社区摘要；图谱界面支持拖拽调宽与节点详情侧栏。
+- **可追溯 Trace**：LLM 调用与过程落盘 `data/traces/*.jsonl`，前端可直接查看与导出。
+- **稳定性加固**：前端 ErrorBoundary 防白屏；后端关键 JSON 存储采用原子写入，降低文件损坏风险；启动脚本支持端口自动递增。
 
 ## Setup
 
