@@ -99,6 +99,10 @@ class KBAddRequest(BaseModel):
     text: str
     categories: Optional[List[str]] = None
     agent_ids: Optional[List[str]] = None
+    # Best-effort: index embeddings after insertion.
+    # When omitted, the server will index if an embedding model is configured.
+    index_embeddings: Optional[bool] = None
+    embedding_model: Optional[str] = None
 
 
 class KBSearchResponse(BaseModel):
@@ -115,6 +119,13 @@ class KBIndexRequest(BaseModel):
     categories: Optional[List[str]] = None
     embedding_model: Optional[str] = None
     pool: int = 5000
+
+
+class KBAddBatchRequest(BaseModel):
+    documents: List[KBAddRequest]
+    # When omitted, the server will index if an embedding model is configured.
+    index_embeddings: Optional[bool] = None
+    embedding_model: Optional[str] = None
 
 
 class KGExtractRequest(BaseModel):
@@ -377,6 +388,7 @@ async def kb_index(request: KBIndexRequest):
 async def kb_add_document(request: KBAddRequest):
     import uuid as _uuid
 
+    settings = settings_store.get_settings()
     doc_id = request.id or _uuid.uuid4().hex
     result = kb.add_document(
         doc_id=doc_id,
@@ -386,7 +398,55 @@ async def kb_add_document(request: KBAddRequest):
         categories=request.categories or [],
         agent_ids=request.agent_ids or [],
     )
-    return {"ok": True, **result}
+
+    model = (request.embedding_model or settings.kb_embedding_model or "").strip()
+    should_index = request.index_embeddings if request.index_embeddings is not None else bool(model)
+    embeddings = None
+    if should_index and model:
+        embeddings = await kb_retriever.index_embeddings(
+            embedding_model_spec=model,
+            doc_ids=[doc_id],
+            pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+        )
+
+    return {"ok": True, **result, "embeddings": embeddings}
+
+
+@app.post("/api/kb/documents/batch")
+async def kb_add_documents_batch(request: KBAddBatchRequest):
+    import uuid as _uuid
+
+    settings = settings_store.get_settings()
+    results: List[Dict[str, Any]] = []
+    ok_doc_ids: List[str] = []
+
+    for d in request.documents or []:
+        doc_id = d.id or _uuid.uuid4().hex
+        try:
+            r = kb.add_document(
+                doc_id=doc_id,
+                title=d.title,
+                source=d.source or "",
+                text=d.text,
+                categories=d.categories or [],
+                agent_ids=d.agent_ids or [],
+            )
+            ok_doc_ids.append(doc_id)
+            results.append({"ok": True, **r})
+        except Exception as e:
+            results.append({"ok": False, "doc_id": doc_id, "error": str(e)})
+
+    model = (request.embedding_model or settings.kb_embedding_model or "").strip()
+    should_index = request.index_embeddings if request.index_embeddings is not None else bool(model)
+    embeddings = None
+    if should_index and model and ok_doc_ids:
+        embeddings = await kb_retriever.index_embeddings(
+            embedding_model_spec=model,
+            doc_ids=ok_doc_ids,
+            pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+        )
+
+    return {"ok": True, "results": results, "embeddings": embeddings}
 
 
 @app.delete("/api/kb/documents/{doc_id}")

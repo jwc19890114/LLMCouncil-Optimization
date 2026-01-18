@@ -37,6 +37,7 @@ export default function KnowledgeBasePage({ onBack }) {
   const [agents, setAgents] = useState([]);
   const [selectedAgentIds, setSelectedAgentIds] = useState(new Set());
   const [categories, setCategories] = useState([]);
+  const [batchItems, setBatchItems] = useState([]); // [{ filename, isMarkdown, title, source, text, size }]
   const [filename, setFilename] = useState('');
   const [isMarkdown, setIsMarkdown] = useState(false);
   const [title, setTitle] = useState('');
@@ -49,6 +50,7 @@ export default function KnowledgeBasePage({ onBack }) {
   const [editingDocCategories, setEditingDocCategories] = useState([]);
 
   const enabledAgents = useMemo(() => agents.filter((a) => a.enabled), [agents]);
+  const isBatch = useMemo(() => Array.isArray(batchItems) && batchItems.length > 0, [batchItems]);
   const existingCategories = useMemo(() => {
     const set = new Set();
     for (const d of docs || []) {
@@ -110,11 +112,49 @@ export default function KnowledgeBasePage({ onBack }) {
 
   async function handleFiles(files) {
     setError('');
-    const f = files?.[0];
-    if (!f) return;
+    const picked = Array.from(files || []).filter(Boolean);
+    if (picked.length === 0) return;
+
+    if (picked.length > 1) {
+      setIsLoading(true);
+      try {
+        const items = [];
+        for (const f of picked) {
+          const name = f.name || '';
+          const md = isMarkdownFile(name);
+          if (f.size > 8 * 1024 * 1024) {
+            setError('包含超大文件（>8MB），建议拆分后上传以提升检索与抽取效果。');
+          }
+          const content = await f.text();
+          items.push({
+            filename: name,
+            isMarkdown: md,
+            title: inferTitle({ filename: name, text: content, isMarkdown: md }),
+            source: name,
+            text: content,
+            size: f.size,
+          });
+        }
+        setBatchItems(items);
+        setFilename('');
+        setIsMarkdown(false);
+        setTitle('');
+        setSource('');
+        setText('');
+        setShowPreview(false);
+      } catch (e) {
+        setError(e?.message || '读取文件失败');
+      } finally {
+        setIsLoading(false);
+      }
+      return;
+    }
+
+    const f = picked[0];
 
     const name = f.name || '';
     const md = isMarkdownFile(name);
+    setBatchItems([]);
     setFilename(name);
     setIsMarkdown(md);
     setSource(name);
@@ -157,6 +197,60 @@ export default function KnowledgeBasePage({ onBack }) {
       await reload();
     } catch (e) {
       setError(e?.message || '保存失败');
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  function updateBatchTitle(index, nextTitle) {
+    setBatchItems((prev) => {
+      const list = Array.isArray(prev) ? [...prev] : [];
+      if (!list[index]) return prev;
+      list[index] = { ...list[index], title: nextTitle };
+      return list;
+    });
+  }
+
+  function removeBatchItem(index) {
+    setBatchItems((prev) => {
+      const list = Array.isArray(prev) ? [...prev] : [];
+      list.splice(index, 1);
+      return list;
+    });
+  }
+
+  async function saveBatch() {
+    setError('');
+    const items = Array.isArray(batchItems) ? batchItems : [];
+    if (items.length === 0) {
+      setError('未选择文件');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const documents = items.map((it) => ({
+        title: (it.title || '').trim() || fileStem(it.filename) || '未命名文档',
+        source: it.source || it.filename || '',
+        text: it.text || '',
+        categories,
+        agent_ids: Array.from(selectedAgentIds),
+      }));
+      const resp = await api.addKBDocumentsBatch({ documents });
+      const okCount = (resp?.results || []).filter((r) => r?.ok).length;
+      const failCount = (resp?.results || []).filter((r) => !r?.ok).length;
+      if (failCount > 0) {
+        setError(`批量入库完成：成功 ${okCount}，失败 ${failCount}（可打开控制台查看详细返回）`);
+        console.log('KB batch response:', resp);
+      } else {
+        alert(`批量入库完成：成功 ${okCount}`);
+      }
+      setBatchItems([]);
+      setCategories([]);
+      setSelectedAgentIds(new Set());
+      await reload();
+    } catch (e) {
+      setError(e?.message || '批量保存失败');
     } finally {
       setIsLoading(false);
     }
@@ -279,6 +373,7 @@ export default function KnowledgeBasePage({ onBack }) {
                   选择文件
                   <input
                     type="file"
+                    multiple
                     accept=".txt,.md,.markdown,text/plain,text/markdown"
                     onChange={(e) => handleFiles(e.target.files)}
                   />
@@ -286,7 +381,7 @@ export default function KnowledgeBasePage({ onBack }) {
                 <button
                   className="kbpage-btn secondary"
                   onClick={() => setShowPreview((v) => !v)}
-                  disabled={!text}
+                  disabled={!text || isBatch}
                 >
                   {showPreview ? '隐藏预览' : '显示预览'}
                 </button>
@@ -302,7 +397,8 @@ export default function KnowledgeBasePage({ onBack }) {
               }}
             >
               <div className="kbpage-dropzone-title">
-                拖拽上传（.txt / .md）{filename ? `：${filename}` : ''}
+                拖拽上传（.txt / .md）
+                {isBatch ? `：已选择 ${batchItems.length} 个文件` : filename ? `：${filename}` : ''}
               </div>
               <div className="kbpage-dropzone-hint">
                 提示：为获得更好的检索与图谱抽取效果，建议每篇文档主题单一、长度适中。
@@ -311,10 +407,42 @@ export default function KnowledgeBasePage({ onBack }) {
 
             {error && <div className="kbpage-error">{error}</div>}
 
+            {isBatch && (
+              <div className="kbpage-batch">
+                <div className="kbpage-hint">批量入库：将按文件分别创建知识库文档（可在此编辑标题）。</div>
+                <div className="kbpage-batch-list">
+                  {batchItems.map((it, idx) => (
+                    <div key={`${it.filename}-${idx}`} className="kbpage-batch-item">
+                      <div className="kbpage-batch-name">{it.filename || `文件${idx + 1}`}</div>
+                      <input
+                        className="kbpage-batch-title"
+                        value={it.title || ''}
+                        onChange={(e) => updateBatchTitle(idx, e.target.value)}
+                        placeholder="标题"
+                      />
+                      <button
+                        type="button"
+                        className="kbpage-btn danger"
+                        onClick={() => removeBatchItem(idx)}
+                        disabled={isLoading}
+                      >
+                        移除
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className="kbpage-form">
               <label className="kbpage-field">
                 <div className="kbpage-label">标题</div>
-                <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="自动解析，可编辑" />
+                <input
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder={isBatch ? '批量模式下不使用此字段' : '自动解析，可编辑'}
+                  disabled={isBatch}
+                />
               </label>
 
               <label className="kbpage-field">
@@ -323,6 +451,7 @@ export default function KnowledgeBasePage({ onBack }) {
                   value={source}
                   onChange={(e) => setSource(e.target.value)}
                   placeholder="例如：文件名 / 网址 / 内部编号"
+                  disabled={isBatch}
                 />
               </label>
 
@@ -363,14 +492,20 @@ export default function KnowledgeBasePage({ onBack }) {
               <div className="kbpage-split">
                 <div className="kbpage-split-left">
                   <div className="kbpage-label">内容（可编辑）</div>
-                  <textarea value={text} onChange={(e) => setText(e.target.value)} rows={12} />
+                  <textarea
+                    value={text}
+                    onChange={(e) => setText(e.target.value)}
+                    rows={12}
+                    disabled={isBatch}
+                    placeholder={isBatch ? '批量模式下不在此编辑内容（按文件入库）' : ''}
+                  />
                 </div>
                 <div className="kbpage-split-right">
                   <div className="kbpage-label">预览</div>
                   <div className="kbpage-preview">
                     {!showPreview ? (
                       <div className="kbpage-hint">预览已关闭</div>
-                    ) : !text ? (
+                    ) : !text || isBatch ? (
                       <div className="kbpage-hint">上传文件或粘贴内容后显示预览</div>
                     ) : isMarkdown ? (
                       <ReactMarkdown>{text}</ReactMarkdown>
@@ -382,12 +517,19 @@ export default function KnowledgeBasePage({ onBack }) {
               </div>
 
               <div className="kbpage-actions">
-                <button className="kbpage-btn primary" onClick={saveDoc} disabled={isLoading}>
-                  保存到知识库
-                </button>
+                {isBatch ? (
+                  <button className="kbpage-btn primary" onClick={saveBatch} disabled={isLoading || batchItems.length === 0}>
+                    批量保存（{batchItems.length}）
+                  </button>
+                ) : (
+                  <button className="kbpage-btn primary" onClick={saveDoc} disabled={isLoading}>
+                    保存到知识库
+                  </button>
+                )}
                 <button
                   className="kbpage-btn secondary"
                   onClick={() => {
+                    setBatchItems([]);
                     setFilename('');
                     setIsMarkdown(false);
                     setTitle('');

@@ -205,6 +205,40 @@
   font-size: 13px;
 }
 
+.kbpage-batch {
+  margin: 0 12px;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  border-radius: 12px;
+}
+
+.kbpage-batch-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kbpage-batch-item {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.kbpage-batch-name {
+  font-size: 13px;
+  color: #334155;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kbpage-batch-title {
+  width: 100%;
+}
+
 .kbpage-field {
   display: block;
 }

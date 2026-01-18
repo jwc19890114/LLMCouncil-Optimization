@@ -209,6 +209,16 @@ export const api = {
     return response.json();
   },
 
+  async addKBDocumentsBatch({ documents, index_embeddings = null, embedding_model = null } = {}) {
+    const response = await fetch(`${API_BASE}/api/kb/documents/batch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ documents, index_embeddings, embedding_model }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '批量新增知识库文档失败'));
+    return response.json();
+  },
+
   async updateKBDocument(docId, patch) {
     const response = await fetch(`${API_BASE}/api/kb/documents/${docId}`, {
       method: 'PUT',
