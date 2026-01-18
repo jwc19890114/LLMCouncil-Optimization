@@ -1,0 +1,45 @@
+.stage0 {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.stage0-title {
+  font-weight: 800;
+  color: #0f172a;
+  margin-bottom: 6px;
+}
+
+.stage0-summary {
+  font-size: 14px;
+  color: #0f172a;
+  line-height: 1.6;
+}
+
+.stage0-block {
+  margin-top: 10px;
+}
+
+.stage0-label {
+  font-size: 12px;
+  color: #475569;
+  font-weight: 800;
+  margin-bottom: 6px;
+}
+
+.stage0-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #0f172a;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.stage0-useddocs {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #64748b;
+}
+

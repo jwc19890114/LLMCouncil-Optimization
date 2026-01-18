@@ -1,0 +1,50 @@
+.stage2b {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.stage2b-title {
+  font-weight: 800;
+  color: #0f172a;
+  margin-bottom: 10px;
+}
+
+.stage2b-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.stage2b-item {
+  border: 1px solid #f1f5f9;
+  border-radius: 10px;
+  padding: 10px;
+  background: #fbfdff;
+}
+
+.stage2b-meta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.stage2b-name {
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.stage2b-model {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.stage2b-content {
+  font-size: 13px;
+  color: #0f172a;
+  line-height: 1.6;
+}
+

@@ -19,7 +19,10 @@ from .council import (
     run_full_council,
     stage1_collect_responses,
     stage2_collect_rankings,
+    stage2b_roundtable,
+    stage2c_fact_check,
     stage3_synthesize_final,
+    stage0_preprocess,
 )
 from .kb_store import KBStore
 from .kb_retrieval import KBHybridRetriever
@@ -90,6 +93,10 @@ class SettingsPatchRequest(BaseModel):
     kb_rerank_model: Optional[str] = None
     kb_semantic_pool: Optional[int] = None
     kb_initial_k: Optional[int] = None
+    enable_preprocess: Optional[bool] = None
+    enable_roundtable: Optional[bool] = None
+    enable_fact_check: Optional[bool] = None
+    roundtable_rounds: Optional[int] = None
 
 
 class KBAddRequest(BaseModel):
@@ -1020,7 +1027,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         title = await generate_conversation_title(request.content, conversation_id=conversation_id)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
+    # Run the full council process (includes optional extra stages)
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
         request.content, conversation_id=conversation_id
     )
@@ -1038,7 +1045,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         "stage1": stage1_results,
         "stage2": stage2_results,
         "stage3": stage3_result,
-        "metadata": metadata
+        "metadata": metadata,
     }
 
 
@@ -1066,9 +1073,14 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content, conversation_id=conversation_id))
 
+            # Stage 0: Preprocess (optional)
+            yield f"data: {json.dumps({'type': 'stage0_start'})}\n\n"
+            preprocess = await stage0_preprocess(request.content, conversation_id)
+            yield f"data: {json.dumps({'type': 'stage0_complete', 'data': preprocess})}\n\n"
+
             # Stage 1: Collect responses
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content, conversation_id=conversation_id)
+            stage1_results = await stage1_collect_responses(request.content, conversation_id=conversation_id, preprocess=preprocess)
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
             # Stage 2: Collect rankings
@@ -1077,9 +1089,26 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_agent)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_agent': label_to_agent, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
+            # Stage 2B: Roundtable (optional)
+            yield f"data: {json.dumps({'type': 'stage2b_start'})}\n\n"
+            roundtable = await stage2b_roundtable(request.content, stage1_results, stage2_results, conversation_id=conversation_id)
+            yield f"data: {json.dumps({'type': 'stage2b_complete', 'data': roundtable})}\n\n"
+
+            # Stage 2C: Fact-check (optional)
+            yield f"data: {json.dumps({'type': 'stage2c_start'})}\n\n"
+            fact_check = await stage2c_fact_check(request.content, stage1_results, stage2_results, roundtable, conversation_id=conversation_id)
+            yield f"data: {json.dumps({'type': 'stage2c_complete', 'data': fact_check})}\n\n"
+
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results, conversation_id=conversation_id)
+            stage3_result = await stage3_synthesize_final(
+                request.content,
+                stage1_results,
+                stage2_results,
+                roundtable=roundtable,
+                fact_check=fact_check,
+                conversation_id=conversation_id,
+            )
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # Wait for title generation if it was started

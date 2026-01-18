@@ -1,0 +1,25 @@
+.stage2c {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.stage2c-title {
+  font-weight: 800;
+  color: #0f172a;
+  margin-bottom: 10px;
+}
+
+.stage2c-pre {
+  margin: 0;
+  padding: 10px;
+  background: #0b1020;
+  color: #e2e8f0;
+  border-radius: 10px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.5;
+}
+

@@ -4,6 +4,9 @@ import { api } from '../api';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
+import Stage0 from './Stage0';
+import Stage2b from './Stage2b';
+import Stage2c from './Stage2c';
 import './ChatInterface.css';
 
 export default function ChatInterface({
@@ -275,6 +278,15 @@ export default function ChatInterface({
                 <div className="assistant-message">
                   <div className="message-label">专家委员会</div>
 
+                  {/* Stage 0 */}
+                  {msg.loading?.stage0 && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>阶段 0 进行中：文档预处理...</span>
+                    </div>
+                  )}
+                  {msg.stage0 && <Stage0 preprocess={msg.stage0} />}
+
                   {/* Stage 1 */}
                   {msg.loading?.stage1 && (
                     <div className="stage-loading">
@@ -298,6 +310,24 @@ export default function ChatInterface({
                       aggregateRankings={msg.metadata?.aggregate_rankings}
                     />
                   )}
+
+                  {/* Stage 2B */}
+                  {msg.loading?.stage2b && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>阶段 2B 进行中：圆桌讨论...</span>
+                    </div>
+                  )}
+                  {msg.stage2b && <Stage2b messages={msg.stage2b} />}
+
+                  {/* Stage 2C */}
+                  {msg.loading?.stage2c && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>阶段 2C 进行中：事实核查与证据整理...</span>
+                    </div>
+                  )}
+                  {msg.stage2c && <Stage2c factCheck={msg.stage2c} />}
 
                   {/* Stage 3 */}
                   {msg.loading?.stage3 && (

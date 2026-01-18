@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -15,6 +17,18 @@ from .storage import get_conversation
 from .trace_store import append as trace_append
 from .web_search import ddg_search
 from .neo4j_store import Neo4jKGStore
+
+
+def _extract_json_object(text: str) -> Dict[str, Any] | None:
+    if not text:
+        return None
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
 
 
 def _agent_vote_weight(agent: AgentConfig) -> float:
@@ -175,6 +189,96 @@ _kb = KBStore()
 _kb_retriever = KBHybridRetriever(_kb)
 
 
+async def stage0_preprocess(user_query: str, conversation_id: str | None) -> Dict[str, Any] | None:
+    """
+    Optional pre-processing before Stage1:
+    - Summarize / segment uploaded KB documents bound to the conversation
+    - Propose key questions / subtasks
+    Returns structured JSON (best-effort). The caller can decide how to inject it.
+    """
+    settings = get_settings()
+    if not settings.enable_preprocess:
+        return None
+    if not conversation_id:
+        return None
+
+    doc_ids = _get_conversation_kb_doc_ids(conversation_id)
+    if not doc_ids:
+        return None
+
+    docs: List[Dict[str, Any]] = []
+    total_chars = 0
+    max_total_chars = 24000
+    per_doc_limit = 8000
+    for doc_id in doc_ids[:12]:
+        doc = _kb.get_document(doc_id)
+        if not doc:
+            continue
+        text = (doc.get("text") or "").strip()
+        if not text:
+            continue
+        text = text[:per_doc_limit]
+        total_chars += len(text)
+        if total_chars > max_total_chars:
+            break
+        docs.append(
+            {
+                "doc_id": doc.get("id") or doc_id,
+                "title": doc.get("title") or "",
+                "source": doc.get("source") or "",
+                "text": text,
+            }
+        )
+
+    if not docs:
+        return None
+
+    models = get_agent_models()
+    chairman_spec = _get_conversation_chairman_model(conversation_id) or models.get("chairman_model") or ""
+    chairman_agent = next((a for a in list_agents() if a.enabled and a.model_spec == chairman_spec), None)
+
+    system = (
+        "你是“文档预处理器”。\n"
+        "你的任务：根据用户问题与上传的文档内容，生成预处理摘要，帮助后续专家更快理解材料并提出更好的回答。\n"
+        "要求：\n"
+        "- 必须使用简体中文\n"
+        "- 输出必须是严格 JSON（不要 Markdown，不要解释文字）\n"
+        '- JSON 结构：{"summary":"...","outline":[...],"key_questions":[...],"suggested_subtasks":[...],"used_docs":[...]}。\n'
+        "- summary 不超过 200 字；每个列表最多 8 条；used_docs 里只放 doc_id。\n"
+    )
+    user = (
+        "用户问题：\n"
+        + (user_query or "").strip()
+        + "\n\n上传文档（可能截断）：\n"
+        + "\n\n".join(
+            [
+                f"KB[{d['doc_id']}]\n标题：{d.get('title')}\n来源：{d.get('source')}\n内容：\n{d.get('text')}"
+                for d in docs
+            ]
+        )
+    )
+
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_start", "stage": "stage0", "doc_ids": [d["doc_id"] for d in docs]})
+
+    resp = await _query_agent(
+        conversation_id=conversation_id,
+        stage="stage0",
+        agent=chairman_agent
+        if chairman_agent
+        else AgentConfig(id="preprocess", name="Preprocess", model_spec=chairman_spec or models.get("chairman_model") or ""),
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        timeout=90.0,
+    )
+    raw = (resp or {}).get("content") or ""
+    data = _extract_json_object(raw)
+
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_complete", "stage": "stage0", "ok": bool(data), "raw": raw, "data": data})
+
+    return data
+
+
 async def _build_agent_knowledge(agent: AgentConfig, user_query: str, conversation_id: str | None) -> str:
     """
     Build agent-specific knowledge context:
@@ -283,18 +387,50 @@ async def _build_agent_knowledge(agent: AgentConfig, user_query: str, conversati
 
     return "\n\n".join([p for p in parts if p.strip()]).strip()
 
-async def stage1_collect_responses(user_query: str, conversation_id: str | None = None) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(
+    user_query: str,
+    conversation_id: str | None = None,
+    preprocess: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     """Stage 1: Collect individual responses from all enabled agents."""
     agents = _get_conversation_agents(conversation_id)
     if conversation_id:
         trace_append(conversation_id, {"type": "stage_start", "stage": "stage1"})
 
     context_text = await _build_realtime_context(user_query, conversation_id)
+    preprocess_text = ""
+    if isinstance(preprocess, dict):
+        summary = str(preprocess.get("summary") or "").strip()
+        key_questions = preprocess.get("key_questions") if isinstance(preprocess.get("key_questions"), list) else []
+        subtasks = preprocess.get("suggested_subtasks") if isinstance(preprocess.get("suggested_subtasks"), list) else []
+        used_docs = preprocess.get("used_docs") if isinstance(preprocess.get("used_docs"), list) else []
+        lines = ["【文档预处理摘要（供专家参考）】"]
+        if summary:
+            lines.append(f"摘要：{summary}")
+        if key_questions:
+            lines.append("关键问题：")
+            for q in key_questions[:8]:
+                s = str(q).strip()
+                if s:
+                    lines.append(f"- {s}")
+        if subtasks:
+            lines.append("建议拆分任务：")
+            for t in subtasks[:8]:
+                s = str(t).strip()
+                if s:
+                    lines.append(f"- {s}")
+        if used_docs:
+            ids = [str(x).strip() for x in used_docs[:12] if str(x).strip()]
+            if ids:
+                lines.append("涉及文档： " + ", ".join(ids))
+        preprocess_text = "\n".join(lines).strip()
 
     async def run_one(agent: AgentConfig):
         messages = _agent_system_messages(agent)
         if context_text:
             messages.append({"role": "system", "content": f"可用外部信息：\n{context_text}"})
+        if preprocess_text:
+            messages.append({"role": "system", "content": preprocess_text})
         knowledge = await _build_agent_knowledge(agent, user_query, conversation_id)
         if knowledge:
             messages.append({"role": "system", "content": knowledge})
@@ -426,10 +562,167 @@ FINAL RANKING:
     return stage2_results, label_to_agent
 
 
+async def stage2b_roundtable(
+    user_query: str,
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    *,
+    conversation_id: str | None,
+) -> List[Dict[str, Any]]:
+    """Extra stage: agents discuss based on persona + web info (best-effort)."""
+    settings = get_settings()
+    if not settings.enable_roundtable:
+        return []
+
+    agents = _get_conversation_agents(conversation_id)
+    if not agents:
+        return []
+
+    rounds = max(0, min(3, int(settings.roundtable_rounds or 1)))
+    if rounds <= 0:
+        return []
+
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_start", "stage": "stage2b", "rounds": rounds})
+
+    context_text = await _build_realtime_context(user_query, conversation_id)
+    kb_doc_ids = _get_conversation_kb_doc_ids(conversation_id)
+    kb_meta = []
+    for did in kb_doc_ids[:20]:
+        doc = _kb.get_document(did)
+        if doc:
+            kb_meta.append({"doc_id": did, "title": doc.get("title") or "", "source": doc.get("source") or ""})
+
+    s1 = "\n\n".join([f"- {r.get('agent_name')}: {r.get('response')}" for r in stage1_results])
+    s2 = "\n\n".join([f"- {r.get('agent_name')} 的评审：\n{r.get('ranking')}" for r in stage2_results])
+
+    async def run_one(agent: AgentConfig) -> Dict[str, Any] | None:
+        knowledge = await _build_agent_knowledge(agent, user_query, conversation_id)
+        messages = _agent_system_messages(agent)
+        prompt = (
+            "你将参与一轮“专家圆桌讨论”。请以你自己的身份（使用你的专业背景/人设）发表评论，必须基于以下材料：\n"
+            "1) 其它专家的初稿与互评\n"
+            "2) 网页检索结果（若提供）\n"
+            "3) 上传的知识库文档（如有，引用时请标注 KB[doc_id]）\n\n"
+            "要求：\n"
+            "- 用简体中文\n"
+            "- 必须点名回应至少 1 位其它专家（用其 agent_name）\n"
+            "- 尽量引用“网页检索结果”的 URL 或 KB[doc_id] 作为依据（如果给了）\n"
+            "- 输出长度 150~450 字\n"
+        )
+        material = (
+            f"用户问题：{user_query}\n\n"
+            + (f"网页检索结果：\n{context_text}\n\n" if context_text else "")
+            + (f"你的可用知识库/图谱信息：\n{knowledge}\n\n" if knowledge else "")
+            + (f"上传文档列表：\n{json.dumps(kb_meta, ensure_ascii=False)}\n\n" if kb_meta else "")
+            + "阶段1初稿：\n"
+            + s1
+            + "\n\n阶段2互评：\n"
+            + s2
+        )
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="stage2b",
+            agent=agent,
+            messages=messages + [{"role": "user", "content": prompt + "\n\n" + material}],
+            timeout=180.0,
+        )
+        if not resp:
+            return None
+        return {
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "model": agent.model_spec,
+            "message": (resp.get("content") or "").strip(),
+        }
+
+    out: List[Dict[str, Any]] = []
+    for _ in range(rounds):
+        results = await asyncio.gather(*[run_one(a) for a in agents])
+        out = [r for r in results if r]
+
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_complete", "stage": "stage2b", "ok_count": len(out)})
+    return out
+
+
+async def stage2c_fact_check(
+    user_query: str,
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    roundtable: List[Dict[str, Any]],
+    *,
+    conversation_id: str | None,
+) -> Dict[str, Any] | None:
+    """Extra stage: fact-check with evidence and output structured JSON (best-effort)."""
+    settings = get_settings()
+    if not settings.enable_fact_check:
+        return None
+
+    models = get_agent_models()
+    chairman_spec = (_get_conversation_chairman_model(conversation_id) or models.get("chairman_model") or "").strip()
+    if not chairman_spec:
+        chairman_spec = models.get("chairman_model") or ""
+
+    context_text = await _build_realtime_context(user_query, conversation_id)
+    kb_doc_ids = _get_conversation_kb_doc_ids(conversation_id)
+    kb_meta = []
+    for did in kb_doc_ids[:20]:
+        doc = _kb.get_document(did)
+        if doc:
+            kb_meta.append({"doc_id": did, "title": doc.get("title") or "", "source": doc.get("source") or ""})
+
+    system = (
+        "你是“事实核查与证据整理员”。\n"
+        "任务：根据专家初稿、互评、圆桌讨论，以及给定的网页检索结果与上传文档列表，抽取关键主张并进行证据归因。\n"
+        "要求：\n"
+        "- 必须使用简体中文\n"
+        "- 输出必须是严格 JSON（不要 Markdown，不要解释文字）\n"
+        '- JSON 结构：{"claims":[{"claim":"...","status":"supported|uncertain|refuted","evidence":[{"type":"web|kb|other","ref":"...","note":"..."}],"confidence":0.0}],"open_questions":[...]}。\n'
+        "- evidence.ref 若来自网页检索必须包含 URL；若来自上传文档必须用 KB[doc_id]。\n"
+        "- 只列最重要的 5~12 条 claims。\n"
+    )
+
+    user = (
+        f"用户问题：{user_query}\n\n"
+        + (f"网页检索结果：\n{context_text}\n\n" if context_text else "网页检索结果：无\n\n")
+        + (f"上传文档列表：\n{json.dumps(kb_meta, ensure_ascii=False)}\n\n" if kb_meta else "上传文档列表：无\n\n")
+        + "阶段1初稿：\n"
+        + json.dumps(stage1_results, ensure_ascii=False)
+        + "\n\n阶段2互评：\n"
+        + json.dumps(stage2_results, ensure_ascii=False)
+        + "\n\n圆桌讨论：\n"
+        + json.dumps(roundtable or [], ensure_ascii=False)
+    )
+
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_start", "stage": "stage2c", "model": chairman_spec})
+
+    resp = await _query_agent(
+        conversation_id=conversation_id,
+        stage="stage2c",
+        agent=AgentConfig(id="factcheck", name="FactCheck", model_spec=chairman_spec),
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        timeout=180.0,
+    )
+    raw = (resp or {}).get("content") or ""
+    data = _extract_json_object(raw)
+
+    if conversation_id:
+        trace_append(
+            conversation_id,
+            {"type": "stage_complete", "stage": "stage2c", "ok": bool(data), "raw": raw, "data": data},
+        )
+
+    return data
+
+
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
     stage2_results: List[Dict[str, Any]],
+    roundtable: List[Dict[str, Any]] | None = None,
+    fact_check: Dict[str, Any] | None = None,
     conversation_id: str | None = None,
 ) -> Dict[str, Any]:
     """Stage 3: Chairman synthesizes final response."""
@@ -475,6 +768,15 @@ async def stage3_synthesize_final(
 
     settings = get_settings()
     if settings.output_language == "zh":
+        rt_text = ""
+        if roundtable:
+            rt_lines = []
+            for m in (roundtable or [])[:12]:
+                rt_lines.append(f"- {m.get('agent_name')}: {m.get('message')}")
+            if rt_lines:
+                rt_text = "\n".join(rt_lines)
+        fc_text = json.dumps(fact_check, ensure_ascii=False) if fact_check else ""
+
         chairman_prompt = f"""你是“专家委员会”的主席。多位专家针对同一个问题给出了各自的回答，并互相进行了评审与排名。
 
 原始问题：{user_query}
@@ -484,6 +786,12 @@ async def stage3_synthesize_final(
 
 阶段 2：互评与排名
 {stage2_text}
+
+阶段 2B：圆桌讨论（可选）
+{rt_text or '（无）'}
+
+阶段 2C：事实核查 JSON（可选）
+{fc_text or '（无）'}
 
 你的任务：综合以上信息，输出一份最终结论，要求：
 - 准确、完整、可操作
@@ -654,7 +962,8 @@ Title:"""
 
 async def run_full_council(user_query: str, conversation_id: str | None = None) -> Tuple[List, List, Dict, Dict]:
     """Run the complete 3-stage council process."""
-    stage1_results = await stage1_collect_responses(user_query, conversation_id=conversation_id)
+    preprocess = await stage0_preprocess(user_query, conversation_id)
+    stage1_results = await stage1_collect_responses(user_query, conversation_id=conversation_id, preprocess=preprocess)
 
     if not stage1_results:
         missing = []
@@ -679,11 +988,27 @@ async def run_full_council(user_query: str, conversation_id: str | None = None) 
         user_query, stage1_results, conversation_id=conversation_id
     )
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_agent)
-    stage3_result = await stage3_synthesize_final(user_query, stage1_results, stage2_results, conversation_id=conversation_id)
+    roundtable = await stage2b_roundtable(
+        user_query, stage1_results, stage2_results, conversation_id=conversation_id
+    )
+    fact_check = await stage2c_fact_check(
+        user_query, stage1_results, stage2_results, roundtable, conversation_id=conversation_id
+    )
+    stage3_result = await stage3_synthesize_final(
+        user_query,
+        stage1_results,
+        stage2_results,
+        roundtable=roundtable,
+        fact_check=fact_check,
+        conversation_id=conversation_id,
+    )
 
     metadata = {
         "label_to_agent": label_to_agent,
         "aggregate_rankings": aggregate_rankings,
+        "preprocess": preprocess,
+        "roundtable": roundtable,
+        "fact_check": fact_check,
         "agents_snapshot": [
             {
                 "id": a.id,

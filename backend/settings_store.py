@@ -35,6 +35,12 @@ class Settings:
     kb_semantic_pool: int = 2000
     kb_initial_k: int = 24
 
+    # Council pipeline extensions
+    enable_preprocess: bool = True
+    enable_roundtable: bool = True
+    enable_fact_check: bool = True
+    roundtable_rounds: int = 1
+
     updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -71,6 +77,10 @@ def get_settings() -> Settings:
         kb_rerank_model=str(data.get("kb_rerank_model", "") or ""),
         kb_semantic_pool=int(data.get("kb_semantic_pool", 2000)),
         kb_initial_k=int(data.get("kb_initial_k", 24)),
+        enable_preprocess=bool(data.get("enable_preprocess", True)),
+        enable_roundtable=bool(data.get("enable_roundtable", True)),
+        enable_fact_check=bool(data.get("enable_fact_check", True)),
+        roundtable_rounds=max(0, min(3, int(data.get("roundtable_rounds", 1)))),
         updated_at=data.get("updated_at") or datetime.utcnow().isoformat(),
     )
     # Env defaults (allow settings.json to omit/leave empty for these).
@@ -115,6 +125,18 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
 
     if "kb_initial_k" in patch:
         s.kb_initial_k = max(1, min(200, int(patch["kb_initial_k"])))
+
+    if "enable_preprocess" in patch:
+        s.enable_preprocess = bool(patch["enable_preprocess"])
+
+    if "enable_roundtable" in patch:
+        s.enable_roundtable = bool(patch["enable_roundtable"])
+
+    if "enable_fact_check" in patch:
+        s.enable_fact_check = bool(patch["enable_fact_check"])
+
+    if "roundtable_rounds" in patch:
+        s.roundtable_rounds = max(0, min(3, int(patch["roundtable_rounds"])))
 
     s.updated_at = datetime.utcnow().isoformat()
     # Fill defaults from env if not set explicitly
