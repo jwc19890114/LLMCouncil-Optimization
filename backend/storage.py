@@ -217,6 +217,51 @@ def update_conversation_title(conversation_id: str, title: str):
     save_conversation(conversation)
 
 
+def add_direct_assistant_message(
+    conversation_id: str,
+    *,
+    agent_id: str,
+    agent_name: str,
+    model_spec: str,
+    content: str,
+):
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+    conversation["messages"].append(
+        {
+            "role": "assistant",
+            "direct": {
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "model_spec": model_spec,
+                "content": content,
+            },
+        }
+    )
+    save_conversation(conversation)
+
+
+def add_stage4_report_message(
+    conversation_id: str,
+    *,
+    report: Dict[str, Any],
+    agent_id: str = "",
+    agent_name: str = "",
+):
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+    conversation["messages"].append(
+        {
+            "role": "assistant",
+            "stage4": report,
+            "metadata": {"type": "ad_hoc_report", "agent_id": agent_id, "agent_name": agent_name},
+        }
+    )
+    save_conversation(conversation)
+
+
 def update_conversation_agents(conversation_id: str, agent_ids):
     conversation = get_conversation(conversation_id)
     if conversation is None:

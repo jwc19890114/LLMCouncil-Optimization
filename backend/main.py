@@ -24,6 +24,7 @@ from .council import (
     stage3_synthesize_final,
     stage0_preprocess,
     stage4_generate_report,
+    direct_invoke_agent,
 )
 from .kb_store import KBStore
 from .kb_retrieval import KBHybridRetriever
@@ -105,6 +106,8 @@ class SettingsPatchRequest(BaseModel):
     auto_save_report_to_kb: Optional[bool] = None
     auto_bind_report_to_conversation: Optional[bool] = None
     report_kb_category: Optional[str] = None
+    enable_history_context: Optional[bool] = None
+    history_max_messages: Optional[int] = None
 
 
 class KBAddRequest(BaseModel):
@@ -194,6 +197,13 @@ class ConversationChairmanRequest(BaseModel):
 
 
 class ConversationReportRequest(BaseModel):
+    report_requirements: str = ""
+
+
+class ConversationInvokeRequest(BaseModel):
+    action: str  # ask | report
+    agent_id: str
+    content: str = ""
     report_requirements: str = ""
 
 
@@ -986,6 +996,84 @@ async def set_conversation_report(conversation_id: str, request: ConversationRep
     storage.update_conversation_report_requirements(conversation_id, request.report_requirements)
     conv = storage.get_conversation(conversation_id) or {}
     return {"ok": True, "report_requirements": conv.get("report_requirements", "")}
+
+
+@app.post("/api/conversations/{conversation_id}/invoke")
+async def invoke_agent(conversation_id: str, request: ConversationInvokeRequest):
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    action = (request.action or "").strip().lower()
+    agent_id = (request.agent_id or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="agent_id 不能为空")
+
+    agent = agents_store.get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if action in ("ask", "say", "speak"):
+        resp = await direct_invoke_agent(conversation_id=conversation_id, agent=agent, content=request.content)
+        content = (resp or {}).get("content") or ""
+        if not content:
+            raise HTTPException(status_code=400, detail="Agent 未返回有效内容")
+        storage.add_direct_assistant_message(
+            conversation_id,
+            agent_id=agent.id,
+            agent_name=agent.name,
+            model_spec=agent.model_spec,
+            content=content,
+        )
+        return {"ok": True, "type": "direct", "agent": agent.__dict__, "content": content}
+
+    if action in ("report", "write_report"):
+        # Use latest available discussion bundle from conversation (best-effort).
+        msgs = conversation.get("messages") or []
+        last_user = ""
+        for m in reversed(msgs):
+            if isinstance(m, dict) and m.get("role") == "user":
+                last_user = str(m.get("content") or "").strip()
+                if last_user:
+                    break
+        topic = (request.content or "").strip() or last_user
+
+        # Find the latest assistant message that contains stage outputs.
+        bundle = None
+        for m in reversed(msgs):
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            if isinstance(m.get("stage3"), dict) or isinstance(m.get("stage2"), list) or isinstance(m.get("stage1"), list):
+                bundle = m
+                break
+        if bundle is None:
+            raise HTTPException(status_code=400, detail="未找到可用于生成报告的讨论结果（请先完成一次讨论）")
+
+        report = await stage4_generate_report(
+            topic,
+            stage0=bundle.get("stage0") if isinstance(bundle.get("stage0"), dict) else None,
+            stage1_results=list(bundle.get("stage1") or []),
+            stage2_results=list(bundle.get("stage2") or []),
+            roundtable=list(bundle.get("stage2b") or []),
+            fact_check=bundle.get("stage2c") if isinstance(bundle.get("stage2c"), dict) else None,
+            stage3_result=bundle.get("stage3") if isinstance(bundle.get("stage3"), dict) else {},
+            conversation_id=conversation_id,
+            writer_agent_id=agent.id,
+            override_requirements=(request.report_requirements or "").strip() or None,
+        )
+        if not report:
+            raise HTTPException(status_code=400, detail="报告生成失败")
+
+        # Save as a standalone assistant message entry (stage4 only).
+        storage.add_stage4_report_message(
+            conversation_id,
+            report=report,
+            agent_id=agent.id,
+            agent_name=agent.name,
+        )
+        return {"ok": True, "type": "report", "agent": agent.__dict__, "report": report}
+
+    raise HTTPException(status_code=400, detail="action 不支持（可用：ask|report）")
 
 
 @app.put("/api/conversations/{conversation_id}/agents")

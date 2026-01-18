@@ -405,6 +405,7 @@ function App() {
               console.warn('Failed to refresh conversation:', err);
             }
           }}
+          allAgents={status?.agents || []}
           chairmanOptions={(() => (status?.agents || []).filter((a) => a?.enabled))()}
           defaultChairmanLabel={
             (() => {

@@ -163,6 +163,106 @@ def _get_conversation_report_requirements(conversation_id: str | None) -> str:
     return str(conv.get("report_requirements") or "").strip()
 
 
+def _conversation_history_messages(conversation_id: str | None) -> List[Dict[str, str]]:
+    """
+    Convert stored conversation messages into chat messages for context injection.
+    Keeps it compact: only user messages and assistant summaries (stage3/stage4/direct).
+    """
+    settings = get_settings()
+    if not settings.enable_history_context:
+        return []
+    if not conversation_id:
+        return []
+    conv = get_conversation(conversation_id)
+    if not isinstance(conv, dict):
+        return []
+    msgs = conv.get("messages") or []
+    if not isinstance(msgs, list) or not msgs:
+        return []
+
+    max_n = int(settings.history_max_messages or 0)
+    if max_n <= 0:
+        return []
+
+    out: List[Dict[str, str]] = []
+    for m in msgs[-max_n:]:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "user":
+            c = str(m.get("content") or "").strip()
+            if c:
+                out.append({"role": "user", "content": c})
+            continue
+        if role == "assistant":
+            # Prefer direct single-agent messages.
+            direct = m.get("direct")
+            if isinstance(direct, dict):
+                name = str(direct.get("agent_name") or "Agent")
+                c = str(direct.get("content") or "").strip()
+                if c:
+                    out.append({"role": "assistant", "content": f"[{name}] {c}"})
+                continue
+
+            # Include stage3 synthesis as assistant summary.
+            s3 = m.get("stage3")
+            if isinstance(s3, dict):
+                c = str(s3.get("response") or "").strip()
+                if c:
+                    out.append({"role": "assistant", "content": c})
+                    continue
+
+            # Include stage4 report but truncate to avoid huge context.
+            s4 = m.get("stage4")
+            if isinstance(s4, dict):
+                md = str(s4.get("report_markdown") or "").strip()
+                if md:
+                    if len(md) > 1200:
+                        md = md[:1200] + "\n\n（报告内容过长，已截断）"
+                    out.append({"role": "assistant", "content": md})
+                    continue
+    return out
+
+
+async def direct_invoke_agent(
+    *,
+    conversation_id: str,
+    agent: AgentConfig,
+    content: str,
+) -> Dict[str, Any] | None:
+    """Invoke a single agent with conversation context (best-effort)."""
+    user_query = (content or "").strip()
+    if not user_query:
+        return None
+
+    context_text = await _build_realtime_context(user_query, conversation_id)
+    knowledge = await _build_agent_knowledge(agent, user_query, conversation_id)
+    history = _conversation_history_messages(conversation_id)
+
+    messages = _agent_system_messages(agent)
+    if context_text:
+        messages.append({"role": "system", "content": f"可用外部信息：\n{context_text}"})
+    if knowledge:
+        messages.append({"role": "system", "content": knowledge})
+    if history:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "以下是当前会话的历史上下文（节选），供你理解用户意图与已讨论内容：\n"
+                    + "\n\n".join([f"{h['role']}: {h['content']}" for h in history])
+                ),
+            }
+        )
+    messages.append({"role": "user", "content": user_query})
+    return await _query_agent(
+        conversation_id=conversation_id,
+        stage="direct",
+        agent=agent,
+        messages=messages,
+        timeout=180.0,
+    )
+
 async def _build_realtime_context(user_query: str, conversation_id: str | None) -> str:
     settings = get_settings()
     chunks: List[str] = []
@@ -471,6 +571,8 @@ async def stage1_collect_responses(
                 lines.append("涉及文档： " + ", ".join(ids))
         preprocess_text = "\n".join(lines).strip()
 
+    history = _conversation_history_messages(conversation_id)
+
     async def run_one(agent: AgentConfig):
         messages = _agent_system_messages(agent)
         if context_text:
@@ -480,6 +582,16 @@ async def stage1_collect_responses(
         knowledge = await _build_agent_knowledge(agent, user_query, conversation_id)
         if knowledge:
             messages.append({"role": "system", "content": knowledge})
+        if history:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "以下是当前会话的历史上下文（节选），供你理解用户意图与已讨论内容：\n"
+                        + "\n\n".join([f"{h['role']}: {h['content']}" for h in history])
+                    ),
+                }
+            )
         messages.append({"role": "user", "content": user_query})
         return agent, await _query_agent(
             conversation_id=conversation_id,
@@ -812,6 +924,8 @@ async def stage4_generate_report(
     fact_check: Dict[str, Any] | None,
     stage3_result: Dict[str, Any],
     conversation_id: str | None,
+    writer_agent_id: str | None = None,
+    override_requirements: str | None = None,
 ) -> Dict[str, Any] | None:
     settings = get_settings()
     if not settings.enable_report_generation:
@@ -826,14 +940,14 @@ async def stage4_generate_report(
 
     chairman_agent = None
     agents = list_agents()
-    caid = _get_conversation_chairman_agent_id(conversation_id)
+    caid = writer_agent_id or _get_conversation_chairman_agent_id(conversation_id)
     if caid:
         chairman_agent = next((a for a in agents if a.id == caid), None)
     if not chairman_agent:
         chairman_agent = next((a for a in agents if a.model_spec == chairman_spec), None)
 
     # Build prompt
-    requirements = _get_conversation_report_requirements(conversation_id) or ""
+    requirements = (override_requirements or "").strip() or _get_conversation_report_requirements(conversation_id) or ""
     instructions = (requirements or settings.report_instructions or "").strip()
 
     context_text = await _build_realtime_context(user_query, conversation_id)

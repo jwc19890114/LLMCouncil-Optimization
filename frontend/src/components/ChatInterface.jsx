@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
 import Stage1 from './Stage1';
@@ -19,6 +19,7 @@ export default function ChatInterface({
   onShowGraph,
   graphOptions,
   onRefreshConversation,
+  allAgents,
   chairmanOptions,
   defaultChairmanLabel,
 }) {
@@ -26,14 +27,31 @@ export default function ChatInterface({
   const [uploadError, setUploadError] = useState('');
   const [uploadNotice, setUploadNotice] = useState('');
   const [isUploading, setIsUploading] = useState(false);
+  const [isInvoking, setIsInvoking] = useState(false);
   const [isReportReqOpen, setIsReportReqOpen] = useState(false);
   const [reportRequirementsDraft, setReportRequirementsDraft] = useState('');
   const [trace, setTrace] = useState([]);
   const [showTrace, setShowTrace] = useState(false);
   const [traceError, setTraceError] = useState('');
   const [expandedTraceIndex, setExpandedTraceIndex] = useState(null);
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashItems, setSlashItems] = useState([]);
+  const [slashIndex, setSlashIndex] = useState(0);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+
+  const enabledAgents = useMemo(
+    () => (Array.isArray(allAgents) ? allAgents.filter((a) => a?.enabled) : []),
+    [allAgents]
+  );
+  const selectedIds = useMemo(
+    () => (Array.isArray(conversation?.agent_ids) ? conversation.agent_ids : null),
+    [conversation?.agent_ids]
+  );
+  const groupAgents = useMemo(
+    () => (selectedIds ? enabledAgents.filter((a) => selectedIds.includes(a.id)) : enabledAgents),
+    [selectedIds, enabledAgents]
+  );
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -62,12 +80,206 @@ export default function ChatInterface({
     };
   }, [conversation?.id]);
 
+  function parseSlashContext(text) {
+    const v = String(text || '');
+    const caretLine = v.split('\n').slice(-1)[0] || '';
+    if (!caretLine.startsWith('/')) return null;
+    const raw = caretLine.slice(1);
+    const tokens = raw.split(/\s+/).filter((t) => t.length > 0);
+    return { line: caretLine, raw, tokens };
+  }
+
+  function applySlashItem(ctx, item) {
+    const full = String(input || '');
+    const lines = full.split('\n');
+    const last = lines[lines.length - 1] || '';
+    if (!last.startsWith('/')) return;
+
+    if (item.type === 'command') {
+      lines[lines.length - 1] = `/${item.key} `;
+      setInput(lines.join('\n'));
+      return;
+    }
+
+    if (item.type === 'agent') {
+      lines[lines.length - 1] = `/ask ${item.agent.id} `;
+      setInput(lines.join('\n'));
+      return;
+    }
+
+    if (item.type === 'invite') {
+      lines[lines.length - 1] = `/add ${item.agent.id} `;
+      setInput(lines.join('\n'));
+      return;
+    }
+
+    if (item.type === 'agent_for_cmd') {
+      const cmd = item.command;
+      const rest = ctx.tokens.slice(2).join(' ');
+      lines[lines.length - 1] = `/${cmd} ${item.agent.id}${rest ? ` ${rest}` : ' '}`;
+      setInput(lines.join('\n'));
+      return;
+    }
+  }
+
+  useEffect(() => {
+    const ctx = parseSlashContext(input);
+    if (!ctx) {
+      setSlashOpen(false);
+      setSlashItems([]);
+      setSlashIndex(0);
+      return;
+    }
+
+    const items = [];
+    const token0 = ctx.tokens?.[0] || '';
+    const token1 = ctx.tokens?.[1] || '';
+
+    const commands = [
+      { key: 'ask', label: 'ask（让某个 Agent 单独回答）' },
+      { key: 'report', label: 'report（让某个 Agent 单独撰写报告）' },
+      { key: 'add', label: 'add（把某个 Agent 拉进本会话）' },
+    ];
+
+    if (ctx.tokens.length <= 1) {
+      for (const c of commands) {
+        if (!token0 || c.key.startsWith(token0.toLowerCase())) {
+          items.push({ type: 'command', key: c.key, label: `/${c.key} …` });
+        }
+      }
+      for (const a of groupAgents) {
+        const name = String(a?.name || '');
+        if (!token0 || name.toLowerCase().includes(token0.toLowerCase())) {
+          items.push({ type: 'agent', key: a.id, label: `${name}（组内）`, agent: a });
+        }
+      }
+      for (const a of enabledAgents) {
+        if (selectedIds && selectedIds.includes(a.id)) continue;
+        const name = String(a?.name || '');
+        if (!token0 || name.toLowerCase().includes(token0.toLowerCase())) {
+          items.push({ type: 'invite', key: a.id, label: `${name}（可邀请）`, agent: a });
+        }
+      }
+      items.splice(16);
+    } else if (['ask', 'report', 'add'].includes(token0.toLowerCase())) {
+      const cmd = token0.toLowerCase();
+      const pool = cmd === 'add' ? enabledAgents : groupAgents;
+      for (const a of pool) {
+        const name = String(a?.name || '');
+        if (
+          !token1 ||
+          name.toLowerCase().includes(token1.toLowerCase()) ||
+          String(a.id).startsWith(token1)
+        ) {
+          items.push({
+            type: 'agent_for_cmd',
+            key: a.id,
+            label: `${name} (${a.id})`,
+            agent: a,
+            command: cmd,
+          });
+        }
+      }
+      items.splice(16);
+    }
+
+    setSlashItems(items);
+    setSlashOpen(items.length > 0);
+    setSlashIndex(0);
+  }, [input, enabledAgents, groupAgents, selectedIds]);
+
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (input.trim() && !isLoading) {
-      onSendMessage(input);
-      setInput('');
+    const raw = (input || '').trim();
+    if (!raw || isLoading || isUploading || isInvoking) return;
+
+    if (raw.startsWith('/')) {
+      const ctx = parseSlashContext(raw);
+      const tokens = (ctx?.tokens || []).slice();
+      const token0 = (tokens[0] || '').toLowerCase();
+      let action = token0;
+      let agentToken = tokens[1] || '';
+      let rest = tokens.slice(2).join(' ');
+
+      if (!['ask', 'report', 'add'].includes(action)) {
+        agentToken = tokens[0] || '';
+        rest = tokens.slice(1).join(' ');
+        action = 'ask';
+      }
+
+      const findAgent = (t) => {
+        const s = String(t || '').trim();
+        if (!s) return null;
+        const byId = enabledAgents.find((a) => a.id === s);
+        if (byId) return byId;
+        const byName = enabledAgents.find((a) => String(a.name || '').trim() === s);
+        if (byName) return byName;
+        return null;
+      };
+
+      const agent = findAgent(agentToken);
+      if (!agent) {
+        setUploadError('未找到该 Agent（请在 “/” 下拉中选择）');
+        return;
+      }
+
+      (async () => {
+        setIsInvoking(true);
+        setUploadError('');
+        try {
+          if (action === 'add') {
+            const current = Array.isArray(conversation?.agent_ids) ? conversation.agent_ids : null;
+            const base = current ? [...current] : enabledAgents.map((a) => a.id);
+            const next = Array.from(new Set([...base, agent.id]));
+            await api.setConversationAgents(conversation.id, next);
+            await onRefreshConversation?.();
+            setInput('');
+            setUploadNotice(`已将 ${agent.name} 拉入本会话。你可以继续输入你的要求并发送。`);
+            setTimeout(() => setUploadNotice(''), 6000);
+            return;
+          }
+
+          if (action === 'report') {
+            let topic = '';
+            let reportReq = rest;
+            if (rest.includes('||')) {
+              const [a, b] = rest.split('||');
+              topic = (a || '').trim();
+              reportReq = (b || '').trim();
+            }
+            await api.invokeConversationAgent(conversation.id, {
+              action: 'report',
+              agent_id: agent.id,
+              content: topic,
+              report_requirements: reportReq,
+            });
+            await onRefreshConversation?.();
+            setInput('');
+            return;
+          }
+
+          if (!rest.trim()) {
+            setUploadError('请输入要让该 Agent 完成的任务内容');
+            return;
+          }
+          await api.invokeConversationAgent(conversation.id, {
+            action: 'ask',
+            agent_id: agent.id,
+            content: rest,
+          });
+          await onRefreshConversation?.();
+          setInput('');
+        } catch (err) {
+          setUploadError(err?.message || '执行失败');
+        } finally {
+          setIsInvoking(false);
+        }
+      })();
+      return;
     }
+
+    onSendMessage(input);
+    setInput('');
   };
 
   const handleKeyDown = (e) => {
@@ -345,6 +557,17 @@ export default function ChatInterface({
                 <div className="assistant-message">
                   <div className="message-label">专家委员会</div>
 
+                  {msg.direct ? (
+                    <div className="stage2b" style={{ marginTop: 0 }}>
+                      <div className="stage2b-title">
+                        单独发言：{msg.direct.agent_name || 'Agent'}
+                      </div>
+                      <div className="stage2b-content">
+                        <ReactMarkdown>{msg.direct.content || ''}</ReactMarkdown>
+                      </div>
+                    </div>
+                  ) : null}
+
                   {/* Stage 0 */}
                   {msg.loading?.stage0 && (
                     <div className="stage-loading">
@@ -435,11 +658,69 @@ export default function ChatInterface({
           placeholder="输入你的问题...（Shift+Enter 换行，Enter 发送）"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          disabled={isLoading}
+          onKeyDown={(e) => {
+            if (slashOpen) {
+              if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setSlashIndex((i) => Math.min(i + 1, slashItems.length - 1));
+                return;
+              }
+              if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSlashIndex((i) => Math.max(i - 1, 0));
+                return;
+              }
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                setSlashOpen(false);
+                return;
+              }
+              if (e.key === 'Tab') {
+                const ctx = parseSlashContext(input);
+                const item = slashItems[slashIndex];
+                if (ctx && item) {
+                  e.preventDefault();
+                  applySlashItem(ctx, item);
+                  return;
+                }
+              }
+              if (e.key === 'Enter' && slashItems[slashIndex]) {
+                const ctx = parseSlashContext(input);
+                if (ctx && ctx.tokens.length <= 2) {
+                  e.preventDefault();
+                  applySlashItem(ctx, slashItems[slashIndex]);
+                  return;
+                }
+              }
+            }
+            handleKeyDown(e);
+          }}
+          disabled={isLoading || isInvoking}
           rows={3}
         />
-        <button type="submit" className="send-button" disabled={!input.trim() || isLoading}>
+        {slashOpen && slashItems.length > 0 && (
+          <div className="slash-menu">
+            {slashItems.map((it, idx) => (
+              <button
+                key={`${it.type}-${it.key}-${idx}`}
+                type="button"
+                className={`slash-item ${idx === slashIndex ? 'on' : ''}`}
+                onClick={() => {
+                  const ctx = parseSlashContext(input);
+                  if (!ctx) return;
+                  applySlashItem(ctx, it);
+                }}
+              >
+                {it.label}
+              </button>
+            ))}
+          </div>
+        )}
+        <button
+          type="submit"
+          className="send-button"
+          disabled={!input.trim() || isLoading || isUploading || isInvoking}
+        >
           发送
         </button>
       </form>

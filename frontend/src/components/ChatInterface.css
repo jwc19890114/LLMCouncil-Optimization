@@ -312,6 +312,7 @@
   padding: 24px;
   border-top: 1px solid #e0e0e0;
   background: #fafafa;
+  position: relative;
 }
 
 .message-input {
@@ -339,6 +340,42 @@
   opacity: 0.5;
   cursor: not-allowed;
   background: #f5f5f5;
+}
+
+.slash-menu {
+  position: absolute;
+  left: 24px;
+  right: 160px;
+  bottom: 120px;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 10px 40px rgba(15, 23, 42, 0.15);
+  padding: 6px;
+  z-index: 50;
+}
+
+.slash-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  color: #0f172a;
+}
+
+.slash-item:hover {
+  background: #f8fafc;
+}
+
+.slash-item.on {
+  border-color: #93c5fd;
+  background: #eff6ff;
 }
 
 .send-button {

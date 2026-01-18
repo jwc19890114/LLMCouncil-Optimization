@@ -61,6 +61,10 @@ class Settings:
     auto_bind_report_to_conversation: bool = True
     report_kb_category: str = "council_reports"
 
+    # Conversation history injection (for new agents / continuity)
+    enable_history_context: bool = True
+    history_max_messages: int = 12
+
     updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -108,6 +112,8 @@ def get_settings() -> Settings:
         auto_save_report_to_kb=bool(data.get("auto_save_report_to_kb", True)),
         auto_bind_report_to_conversation=bool(data.get("auto_bind_report_to_conversation", True)),
         report_kb_category=str(data.get("report_kb_category", "council_reports") or "council_reports"),
+        enable_history_context=bool(data.get("enable_history_context", True)),
+        history_max_messages=max(0, min(50, int(data.get("history_max_messages", 12)))),
         updated_at=data.get("updated_at") or datetime.utcnow().isoformat(),
     )
     # Env defaults (allow settings.json to omit/leave empty for these).
@@ -185,6 +191,12 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
 
     if "report_kb_category" in patch:
         s.report_kb_category = str(patch["report_kb_category"] or "").strip() or "council_reports"
+
+    if "enable_history_context" in patch:
+        s.enable_history_context = bool(patch["enable_history_context"])
+
+    if "history_max_messages" in patch:
+        s.history_max_messages = max(0, min(50, int(patch["history_max_messages"])))
 
     s.updated_at = datetime.utcnow().isoformat()
     # Fill defaults from env if not set explicitly

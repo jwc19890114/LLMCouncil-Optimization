@@ -181,6 +181,16 @@ export const api = {
     return response.json();
   },
 
+  async invokeConversationAgent(conversationId, { action, agent_id, content = '', report_requirements = '' } = {}) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/invoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, agent_id, content, report_requirements }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '调用 Agent 失败'));
+    return response.json();
+  },
+
   async setConversationAgents(conversationId, agentIds) {
     const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/agents`, {
       method: 'PUT',
