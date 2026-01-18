@@ -87,6 +87,8 @@ class SettingsPatchRequest(BaseModel):
     enable_date_context: Optional[bool] = None
     enable_web_search: Optional[bool] = None
     web_search_results: Optional[int] = None
+    enable_agent_web_search: Optional[bool] = None
+    agent_web_search_results: Optional[int] = None
     kb_retrieval_mode: Optional[str] = None
     kb_embedding_model: Optional[str] = None
     kb_enable_rerank: Optional[bool] = None

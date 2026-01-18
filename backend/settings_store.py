@@ -26,6 +26,10 @@ class Settings:
     enable_web_search: bool = True
     web_search_results: int = 5
 
+    # Agent-specific web search (per agent, best-effort; can be slower)
+    enable_agent_web_search: bool = False
+    agent_web_search_results: int = 3
+
     # Knowledge base retrieval
     # fts | semantic | hybrid
     kb_retrieval_mode: str = "hybrid"
@@ -71,6 +75,8 @@ def get_settings() -> Settings:
         enable_date_context=bool(data.get("enable_date_context", True)),
         enable_web_search=bool(data.get("enable_web_search", True)),
         web_search_results=int(data.get("web_search_results", 5)),
+        enable_agent_web_search=bool(data.get("enable_agent_web_search", False)),
+        agent_web_search_results=max(0, min(10, int(data.get("agent_web_search_results", 3)))),
         kb_retrieval_mode=str(data.get("kb_retrieval_mode", "hybrid") or "hybrid").lower(),
         kb_embedding_model=str(data.get("kb_embedding_model", "") or ""),
         kb_enable_rerank=bool(data.get("kb_enable_rerank", True)),
@@ -105,6 +111,12 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
         s.enable_web_search = bool(patch["enable_web_search"])
     if "web_search_results" in patch:
         s.web_search_results = max(0, min(20, int(patch["web_search_results"])))
+
+    if "enable_agent_web_search" in patch:
+        s.enable_agent_web_search = bool(patch["enable_agent_web_search"])
+
+    if "agent_web_search_results" in patch:
+        s.agent_web_search_results = max(0, min(10, int(patch["agent_web_search_results"])))
 
     if "kb_retrieval_mode" in patch:
         val = str(patch["kb_retrieval_mode"] or "").strip().lower()

@@ -8,6 +8,12 @@ function normalizeRounds(v) {
   return Math.max(0, Math.min(3, Math.trunc(n)));
 }
 
+function normalizeAgentSearchResults(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 3;
+  return Math.max(0, Math.min(10, Math.trunc(n)));
+}
+
 export default function SettingsModal({ open, onClose }) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
@@ -47,6 +53,8 @@ export default function SettingsModal({ open, onClose }) {
         enable_roundtable: Boolean(settings.enable_roundtable),
         enable_fact_check: Boolean(settings.enable_fact_check),
         roundtable_rounds: normalizeRounds(settings.roundtable_rounds),
+        enable_agent_web_search: Boolean(settings.enable_agent_web_search),
+        agent_web_search_results: normalizeAgentSearchResults(settings.agent_web_search_results),
       };
       const resp = await api.patchSettings(patch);
       setSettings(resp?.settings || settings);
@@ -85,6 +93,40 @@ export default function SettingsModal({ open, onClose }) {
               />
               <span>启用阶段 0：发送前文档预处理（摘要/拆分/提问）</span>
             </label>
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.enable_agent_web_search)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, enable_agent_web_search: e.target.checked }))
+                }
+              />
+              <span>允许每个 Agent 进行网页检索（每人一次）</span>
+            </label>
+
+            <div className="settings-row-inline">
+              <div className="settings-label">每人条数</div>
+              <select
+                value={normalizeAgentSearchResults(settings.agent_web_search_results)}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    agent_web_search_results: normalizeAgentSearchResults(e.target.value),
+                  }))
+                }
+                disabled={!settings.enable_agent_web_search}
+              >
+                <option value={0}>0</option>
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={5}>5</option>
+                <option value={8}>8</option>
+                <option value={10}>10</option>
+              </select>
+              <div className="settings-hint-inline">开启后会显著变慢，且可能触发 DDG 限流。</div>
+            </div>
 
             <label className="settings-row">
               <input

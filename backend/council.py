@@ -31,6 +31,9 @@ def _extract_json_object(text: str) -> Dict[str, Any] | None:
         return None
 
 
+_agent_web_search_sem = asyncio.Semaphore(3)
+
+
 def _agent_vote_weight(agent: AgentConfig) -> float:
     influence = float(agent.influence_weight)
     seniority = max(0, int(agent.seniority_years))
@@ -286,6 +289,40 @@ async def _build_agent_knowledge(agent: AgentConfig, user_query: str, conversati
     - Neo4j subgraph (if agent.graph_id configured)
     """
     parts: List[str] = []
+
+    # Agent-specific web search (best-effort)
+    try:
+        settings = get_settings()
+        if settings.enable_agent_web_search and settings.agent_web_search_results > 0:
+            q = (user_query or "").strip()
+            if q:
+                # Simple personalization: include agent name as a query hint.
+                query = f"{q} {agent.name}".strip()
+                async with _agent_web_search_sem:
+                    results = await ddg_search(query, max_results=int(settings.agent_web_search_results))
+                if conversation_id:
+                    trace_append(
+                        conversation_id,
+                        {
+                            "type": "web_search_agent",
+                            "agent_id": agent.id,
+                            "agent_name": agent.name,
+                            "query": query,
+                            "results": [r.__dict__ for r in results],
+                        },
+                    )
+                if results:
+                    lines = [f"专家专属网页检索结果（Agent={agent.name}，仅供参考）："]
+                    for i, r in enumerate(results, start=1):
+                        snippet = f" - {r.snippet}" if r.snippet else ""
+                        lines.append(f"{i}. {r.title} ({r.url}){snippet}")
+                    parts.append("\n".join(lines))
+    except Exception as e:
+        if conversation_id:
+            trace_append(
+                conversation_id,
+                {"type": "web_search_agent_error", "agent_id": agent.id, "agent_name": agent.name, "error": str(e)},
+            )
 
     # KB
     try:
