@@ -194,12 +194,15 @@ class KBHybridRetriever:
 
         # Optional rerank (best-effort)
         if enable_rerank and rerank_model_spec:
-            rr = await rerank(
-                model_spec=rerank_model_spec,
-                query=query,
-                candidates=pool_items,
-                top_k=limit,
-            )
+            try:
+                rr = await rerank(
+                    model_spec=rerank_model_spec,
+                    query=query,
+                    candidates=pool_items,
+                    top_k=limit,
+                )
+            except Exception:
+                rr = []
             if rr:
                 out = []
                 for r in rr:

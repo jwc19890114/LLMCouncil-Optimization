@@ -64,14 +64,19 @@ async def rerank(
     )
 
     user = "用户问题：\n" + query + "\n\n候选片段：\n" + "\n\n".join(items)
-    resp = await query_model(
-        model_spec,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        timeout=timeout,
-    )
+    try:
+        resp = await query_model(
+            model_spec,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            timeout=timeout,
+        )
+    except Exception:
+        # Best-effort: rerank is optional. If the model_spec does not support chat/completions
+        # (e.g. some provider-specific rerank-only models), fall back to heuristic ranking.
+        return []
     content = (resp or {}).get("content") or ""
     data = _extract_json_object(content)
     if not data:
@@ -94,4 +99,3 @@ async def rerank(
 
     out.sort(key=lambda x: x["score"], reverse=True)
     return out[:top_k]
-
