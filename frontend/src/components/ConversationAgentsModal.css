@@ -1,0 +1,247 @@
+.conv-agents-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 1000;
+}
+
+.conv-agents-modal {
+  width: min(920px, 100%);
+  background: #ffffff;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.conv-agents-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  background: linear-gradient(180deg, #ffffff 0%, #fbfbfd 100%);
+}
+
+.conv-agents-title {
+  font-weight: 800;
+  color: #0f172a;
+  letter-spacing: 0.2px;
+}
+
+.conv-agents-subtitle {
+  margin-left: 8px;
+  font-weight: 600;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.conv-agents-close {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: #fff;
+  cursor: pointer;
+  font-size: 18px;
+  color: #334155;
+}
+
+.conv-agents-close:hover {
+  background: #f8fafc;
+}
+
+.conv-agents-body {
+  padding: 14px 16px 16px 16px;
+  overflow: auto;
+}
+
+.conv-agents-topbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.conv-agents-hint {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.conv-agents-search {
+  flex: 1;
+  min-width: 240px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.conv-agents-search-input {
+  width: min(420px, 100%);
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 13px;
+  outline: none;
+}
+
+.conv-agents-search-input:focus {
+  border-color: rgba(74, 144, 226, 0.7);
+  box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.12);
+}
+
+.conv-agents-actions {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0 14px 0;
+}
+
+.conv-btn {
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: #ffffff;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  color: #0f172a;
+  font-weight: 600;
+}
+
+.conv-btn:hover {
+  background: #f8fafc;
+}
+
+.conv-btn.primary {
+  background: #4a90e2;
+  border-color: #4a90e2;
+  color: #fff;
+}
+
+.conv-btn.primary:hover {
+  background: #357abd;
+  border-color: #357abd;
+}
+
+.conv-btn.secondary {
+  background: #f8fafc;
+}
+
+.conv-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.conv-error {
+  background: #fff0f0;
+  border: 1px solid #f0b4b4;
+  color: #a40000;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  margin: 10px 0;
+}
+
+.conv-agents-loading {
+  padding: 14px 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.conv-agents-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.conv-agent-card {
+  text-align: left;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: #ffffff;
+  padding: 12px;
+  cursor: pointer;
+  transition: transform 0.08s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+}
+
+.conv-agent-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+  border-color: rgba(74, 144, 226, 0.45);
+}
+
+.conv-agent-card.checked {
+  border-color: rgba(74, 144, 226, 0.7);
+  box-shadow: 0 0 0 3px rgba(74, 144, 226, 0.12);
+}
+
+.conv-agent-card.disabled {
+  opacity: 0.7;
+}
+
+.conv-agent-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.conv-agent-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  background: rgba(74, 144, 226, 0.12);
+  color: #1d4ed8;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+}
+
+.conv-agent-check {
+  width: 22px;
+  height: 22px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-weight: 900;
+  background: #fff;
+}
+
+.conv-agent-check.on {
+  background: #4a90e2;
+  border-color: #4a90e2;
+}
+
+.conv-agent-name {
+  font-size: 14px;
+  font-weight: 800;
+  color: #0f172a;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-agent-spec {
+  font-size: 12px;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-agents-footer {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+
