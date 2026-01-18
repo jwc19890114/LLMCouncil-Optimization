@@ -23,6 +23,7 @@ from .council import (
     stage2c_fact_check,
     stage3_synthesize_final,
     stage0_preprocess,
+    stage4_generate_report,
 )
 from .kb_store import KBStore
 from .kb_retrieval import KBHybridRetriever
@@ -99,6 +100,11 @@ class SettingsPatchRequest(BaseModel):
     enable_roundtable: Optional[bool] = None
     enable_fact_check: Optional[bool] = None
     roundtable_rounds: Optional[int] = None
+    enable_report_generation: Optional[bool] = None
+    report_instructions: Optional[str] = None
+    auto_save_report_to_kb: Optional[bool] = None
+    auto_bind_report_to_conversation: Optional[bool] = None
+    report_kb_category: Optional[str] = None
 
 
 class KBAddRequest(BaseModel):
@@ -174,6 +180,7 @@ class Conversation(BaseModel):
     chairman_model: str = ""
     chairman_agent_id: str = ""
     kb_doc_ids: List[str] = []
+    report_requirements: str = ""
     messages: List[Dict[str, Any]]
 
 
@@ -184,6 +191,10 @@ class ConversationKBDocsRequest(BaseModel):
 class ConversationChairmanRequest(BaseModel):
     chairman_model: str = ""
     chairman_agent_id: str = ""
+
+
+class ConversationReportRequest(BaseModel):
+    report_requirements: str = ""
 
 
 @app.get("/")
@@ -967,6 +978,16 @@ async def set_conversation_chairman(conversation_id: str, request: ConversationC
     }
 
 
+@app.put("/api/conversations/{conversation_id}/report")
+async def set_conversation_report(conversation_id: str, request: ConversationReportRequest):
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    storage.update_conversation_report_requirements(conversation_id, request.report_requirements)
+    conv = storage.get_conversation(conversation_id) or {}
+    return {"ok": True, "report_requirements": conv.get("report_requirements", "")}
+
+
 @app.put("/api/conversations/{conversation_id}/agents")
 async def set_conversation_agents(conversation_id: str, agent_ids: List[str]):
     conversation = storage.get_conversation(conversation_id)
@@ -1034,19 +1055,28 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         request.content, conversation_id=conversation_id
     )
 
-    # Add assistant message with all stages
+    # Add assistant message with all stages (including optional extra stages)
     storage.add_assistant_message(
         conversation_id,
         stage1_results,
         stage2_results,
-        stage3_result
+        stage3_result,
+        stage0=metadata.get("preprocess"),
+        stage2b=metadata.get("roundtable"),
+        stage2c=metadata.get("fact_check"),
+        stage4=metadata.get("report"),
+        metadata=metadata,
     )
 
     # Return the complete response with metadata
     return {
+        "stage0": metadata.get("preprocess"),
         "stage1": stage1_results,
         "stage2": stage2_results,
+        "stage2b": metadata.get("roundtable"),
+        "stage2c": metadata.get("fact_check"),
         "stage3": stage3_result,
+        "stage4": metadata.get("report"),
         "metadata": metadata,
     }
 
@@ -1113,6 +1143,20 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             )
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
+            # Stage 4: Chairman report (optional)
+            yield f"data: {json.dumps({'type': 'stage4_start'})}\n\n"
+            report = await stage4_generate_report(
+                request.content,
+                stage0=preprocess,
+                stage1_results=stage1_results,
+                stage2_results=stage2_results,
+                roundtable=roundtable,
+                fact_check=fact_check,
+                stage3_result=stage3_result,
+                conversation_id=conversation_id,
+            )
+            yield f"data: {json.dumps({'type': 'stage4_complete', 'data': report})}\n\n"
+
             # Wait for title generation if it was started
             if title_task:
                 title = await title_task
@@ -1120,11 +1164,24 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
 
             # Save complete assistant message
+            metadata = {
+                "label_to_agent": label_to_agent,
+                "aggregate_rankings": aggregate_rankings,
+                "preprocess": preprocess,
+                "roundtable": roundtable,
+                "fact_check": fact_check,
+                "report": report,
+            }
             storage.add_assistant_message(
                 conversation_id,
                 stage1_results,
                 stage2_results,
-                stage3_result
+                stage3_result,
+                stage0=preprocess,
+                stage2b=roundtable,
+                stage2c=fact_check,
+                stage4=report,
+                metadata=metadata,
             )
 
             # Send completion event

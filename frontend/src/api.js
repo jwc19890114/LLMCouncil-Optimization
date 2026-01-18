@@ -171,6 +171,16 @@ export const api = {
     return response.json();
   },
 
+  async setConversationReport(conversationId, { report_requirements = '' } = {}) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/report`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ report_requirements }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '设置报告要求失败'));
+    return response.json();
+  },
+
   async setConversationAgents(conversationId, agentIds) {
     const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/agents`, {
       method: 'PUT',

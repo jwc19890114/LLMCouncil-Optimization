@@ -7,6 +7,7 @@ import Stage3 from './Stage3';
 import Stage0 from './Stage0';
 import Stage2b from './Stage2b';
 import Stage2c from './Stage2c';
+import Stage4 from './Stage4';
 import './ChatInterface.css';
 
 export default function ChatInterface({
@@ -24,6 +25,8 @@ export default function ChatInterface({
   const [input, setInput] = useState('');
   const [uploadError, setUploadError] = useState('');
   const [isUploading, setIsUploading] = useState(false);
+  const [isReportReqOpen, setIsReportReqOpen] = useState(false);
+  const [reportRequirementsDraft, setReportRequirementsDraft] = useState('');
   const [trace, setTrace] = useState([]);
   const [showTrace, setShowTrace] = useState(false);
   const [traceError, setTraceError] = useState('');
@@ -197,11 +200,69 @@ export default function ChatInterface({
           <button className="toolbar-btn" onClick={() => setShowTrace((v) => !v)}>
             {showTrace ? '隐藏过程' : '显示过程'}
           </button>
+          <button
+            className="toolbar-btn"
+            onClick={() => {
+              setReportRequirementsDraft(conversation?.report_requirements || '');
+              setIsReportReqOpen(true);
+            }}
+            disabled={isLoading || isUploading}
+            title="设置本会话的报告撰写要求（用于阶段4报告）"
+          >
+            报告要求
+          </button>
           <button className="toolbar-btn" onClick={onExportConversation}>
             导出
           </button>
         </div>
       </div>
+
+      {isReportReqOpen && (
+        <div className="chat-modal-overlay" onClick={() => setIsReportReqOpen(false)}>
+          <div className="chat-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-modal-header">
+              <div className="chat-modal-title">报告要求（本会话）</div>
+              <button className="chat-modal-close" onClick={() => setIsReportReqOpen(false)}>
+                ✕
+              </button>
+            </div>
+            <div className="chat-modal-body">
+              <div className="chat-modal-hint">
+                留空则使用“流程设置”里的默认报告模板。修改后会在下一次讨论结束后的报告生成中生效。
+              </div>
+              <textarea
+                className="chat-modal-textarea"
+                value={reportRequirementsDraft}
+                onChange={(e) => setReportRequirementsDraft(e.target.value)}
+                rows={10}
+                placeholder="例如：请以“专利撰写视角”输出；必须包含：摘要/创新点/风险/实施方案/引用依据..."
+              />
+            </div>
+            <div className="chat-modal-actions">
+              <button className="toolbar-btn" onClick={() => setIsReportReqOpen(false)} disabled={isLoading}>
+                取消
+              </button>
+              <button
+                className="toolbar-btn primary"
+                onClick={async () => {
+                  try {
+                    await api.setConversationReport(conversation.id, {
+                      report_requirements: reportRequirementsDraft,
+                    });
+                    await onRefreshConversation?.();
+                    setIsReportReqOpen(false);
+                  } catch (err) {
+                    setUploadError(err?.message || '设置报告要求失败');
+                  }
+                }}
+                disabled={isLoading}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showTrace && (
         <div className="trace-panel">
@@ -337,6 +398,15 @@ export default function ChatInterface({
                     </div>
                   )}
                   {msg.stage3 && <Stage3 finalResponse={msg.stage3} />}
+
+                  {/* Stage 4 */}
+                  {msg.loading?.stage4 && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>阶段 4 进行中：主席撰写完整报告...</span>
+                    </div>
+                  )}
+                  {msg.stage4 && <Stage4 report={msg.stage4} />}
                 </div>
               )}
             </div>

@@ -45,6 +45,22 @@ class Settings:
     enable_fact_check: bool = True
     roundtable_rounds: int = 1
 
+    # Report generation + persistence
+    enable_report_generation: bool = True
+    report_instructions: str = (
+        "请撰写一份完整分析报告（Markdown），至少包含：\n"
+        "1) 背景与目标\n"
+        "2) 关键材料摘要（如有上传文档/网页信息）\n"
+        "3) 主要观点与分歧（引用专家名称）\n"
+        "4) 事实核查结论（如有 claims JSON，按证据归因）\n"
+        "5) 可执行结论与行动清单\n"
+        "6) 风险与不确定性\n"
+        "7) 附录：引用的 URL 与 KB[doc_id]\n"
+    )
+    auto_save_report_to_kb: bool = True
+    auto_bind_report_to_conversation: bool = True
+    report_kb_category: str = "council_reports"
+
     updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -87,6 +103,11 @@ def get_settings() -> Settings:
         enable_roundtable=bool(data.get("enable_roundtable", True)),
         enable_fact_check=bool(data.get("enable_fact_check", True)),
         roundtable_rounds=max(0, min(3, int(data.get("roundtable_rounds", 1)))),
+        enable_report_generation=bool(data.get("enable_report_generation", True)),
+        report_instructions=str(data.get("report_instructions", Settings().report_instructions) or Settings().report_instructions),
+        auto_save_report_to_kb=bool(data.get("auto_save_report_to_kb", True)),
+        auto_bind_report_to_conversation=bool(data.get("auto_bind_report_to_conversation", True)),
+        report_kb_category=str(data.get("report_kb_category", "council_reports") or "council_reports"),
         updated_at=data.get("updated_at") or datetime.utcnow().isoformat(),
     )
     # Env defaults (allow settings.json to omit/leave empty for these).
@@ -149,6 +170,21 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
 
     if "roundtable_rounds" in patch:
         s.roundtable_rounds = max(0, min(3, int(patch["roundtable_rounds"])))
+
+    if "enable_report_generation" in patch:
+        s.enable_report_generation = bool(patch["enable_report_generation"])
+
+    if "report_instructions" in patch:
+        s.report_instructions = str(patch["report_instructions"] or "").strip()
+
+    if "auto_save_report_to_kb" in patch:
+        s.auto_save_report_to_kb = bool(patch["auto_save_report_to_kb"])
+
+    if "auto_bind_report_to_conversation" in patch:
+        s.auto_bind_report_to_conversation = bool(patch["auto_bind_report_to_conversation"])
+
+    if "report_kb_category" in patch:
+        s.report_kb_category = str(patch["report_kb_category"] or "").strip() or "council_reports"
 
     s.updated_at = datetime.utcnow().isoformat()
     # Fill defaults from env if not set explicitly

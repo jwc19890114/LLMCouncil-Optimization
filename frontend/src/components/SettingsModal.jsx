@@ -55,6 +55,11 @@ export default function SettingsModal({ open, onClose }) {
         roundtable_rounds: normalizeRounds(settings.roundtable_rounds),
         enable_agent_web_search: Boolean(settings.enable_agent_web_search),
         agent_web_search_results: normalizeAgentSearchResults(settings.agent_web_search_results),
+        enable_report_generation: Boolean(settings.enable_report_generation),
+        report_instructions: String(settings.report_instructions || ''),
+        auto_save_report_to_kb: Boolean(settings.auto_save_report_to_kb),
+        auto_bind_report_to_conversation: Boolean(settings.auto_bind_report_to_conversation),
+        report_kb_category: String(settings.report_kb_category || ''),
       };
       const resp = await api.patchSettings(patch);
       setSettings(resp?.settings || settings);
@@ -169,6 +174,68 @@ export default function SettingsModal({ open, onClose }) {
               />
               <span>启用阶段 2C：事实核查（输出结构化 JSON）</span>
             </label>
+
+            <div className="settings-divider" />
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.enable_report_generation)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, enable_report_generation: e.target.checked }))
+                }
+              />
+              <span>启用阶段 4：讨论结束后自动生成完整报告（Markdown）</span>
+            </label>
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.auto_save_report_to_kb)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, auto_save_report_to_kb: e.target.checked }))
+                }
+                disabled={!settings.enable_report_generation}
+              />
+              <span>自动将报告落盘到知识库（供小组复用）</span>
+            </label>
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.auto_bind_report_to_conversation)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, auto_bind_report_to_conversation: e.target.checked }))
+                }
+                disabled={!settings.enable_report_generation || !settings.auto_save_report_to_kb}
+              />
+              <span>落盘后自动绑定到当前会话（后续消息默认可检索）</span>
+            </label>
+
+            <div className="settings-row-inline">
+              <div className="settings-label">报告分类</div>
+              <input
+                value={settings.report_kb_category || ''}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, report_kb_category: e.target.value }))
+                }
+                disabled={!settings.enable_report_generation || !settings.auto_save_report_to_kb}
+              />
+              <div className="settings-hint-inline">用于 KB 分类过滤，例如：council_reports</div>
+            </div>
+
+            <div className="settings-row-textarea">
+              <div className="settings-label">报告模板</div>
+              <textarea
+                value={settings.report_instructions || ''}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, report_instructions: e.target.value }))
+                }
+                rows={8}
+                disabled={!settings.enable_report_generation}
+                placeholder="作为阶段4报告的默认要求（Markdown 结构/章节/格式等）"
+              />
+            </div>
 
             <div className="settings-actions">
               <button className="settings-btn secondary" onClick={onClose} disabled={isLoading}>

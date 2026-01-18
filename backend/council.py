@@ -154,6 +154,15 @@ def _get_conversation_chairman_agent_id(conversation_id: str | None) -> str:
     return str(conv.get("chairman_agent_id") or "").strip()
 
 
+def _get_conversation_report_requirements(conversation_id: str | None) -> str:
+    if not conversation_id:
+        return ""
+    conv = get_conversation(conversation_id)
+    if not isinstance(conv, dict):
+        return ""
+    return str(conv.get("report_requirements") or "").strip()
+
+
 async def _build_realtime_context(user_query: str, conversation_id: str | None) -> str:
     settings = get_settings()
     chunks: List[str] = []
@@ -754,6 +763,170 @@ async def stage2c_fact_check(
     return data
 
 
+async def _save_report_to_kb(
+    *,
+    conversation_id: str,
+    title: str,
+    report_markdown: str,
+    category: str,
+    agent_ids: List[str],
+) -> str | None:
+    import uuid as _uuid
+
+    doc_id = _uuid.uuid4().hex
+    source = f"conversation:{conversation_id}"
+    text = (report_markdown or "").strip()
+    if not text:
+        return None
+
+    _kb.add_document(
+        doc_id=doc_id,
+        title=title,
+        source=source,
+        text=text,
+        categories=[category] if category else [],
+        agent_ids=agent_ids or [],
+    )
+
+    settings = get_settings()
+    model = (settings.kb_embedding_model or "").strip()
+    if model:
+        try:
+            await _kb_retriever.index_embeddings(
+                embedding_model_spec=model,
+                doc_ids=[doc_id],
+                pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+            )
+        except Exception:
+            pass
+    return doc_id
+
+
+async def stage4_generate_report(
+    user_query: str,
+    *,
+    stage0: Dict[str, Any] | None,
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    roundtable: List[Dict[str, Any]],
+    fact_check: Dict[str, Any] | None,
+    stage3_result: Dict[str, Any],
+    conversation_id: str | None,
+) -> Dict[str, Any] | None:
+    settings = get_settings()
+    if not settings.enable_report_generation:
+        return None
+    if not conversation_id:
+        return None
+
+    models = get_agent_models()
+    chairman_spec = (_get_conversation_chairman_model(conversation_id) or models.get("chairman_model") or "").strip()
+    if not chairman_spec:
+        chairman_spec = models.get("chairman_model") or ""
+
+    chairman_agent = None
+    agents = list_agents()
+    caid = _get_conversation_chairman_agent_id(conversation_id)
+    if caid:
+        chairman_agent = next((a for a in agents if a.id == caid), None)
+    if not chairman_agent:
+        chairman_agent = next((a for a in agents if a.model_spec == chairman_spec), None)
+
+    # Build prompt
+    requirements = _get_conversation_report_requirements(conversation_id) or ""
+    instructions = (requirements or settings.report_instructions or "").strip()
+
+    context_text = await _build_realtime_context(user_query, conversation_id)
+    kb_doc_ids = _get_conversation_kb_doc_ids(conversation_id)
+    kb_meta = []
+    for did in kb_doc_ids[:30]:
+        doc = _kb.get_document(did)
+        if doc:
+            kb_meta.append({"doc_id": did, "title": doc.get("title") or "", "source": doc.get("source") or ""})
+
+    payload = {
+        "user_query": user_query,
+        "stage0": stage0,
+        "stage1": stage1_results,
+        "stage2": stage2_results,
+        "stage2b": roundtable,
+        "stage2c": fact_check,
+        "stage3": stage3_result,
+        "kb_docs": kb_meta,
+        "web_context": context_text,
+        "report_instructions": instructions,
+    }
+
+    system = (
+        "你是“专家委员会主席（报告撰写）”。\n"
+        "任务：根据输入材料，撰写一份完整报告。\n"
+        "要求：\n"
+        "- 必须使用简体中文\n"
+        "- 输出必须是 Markdown\n"
+        "- 报告中引用证据时，尽量写明 URL 或 KB[doc_id]\n"
+        "- 不要编造不存在的引用；如果证据不足，明确标注不确定性\n"
+    )
+
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_start", "stage": "stage4", "model": chairman_spec})
+
+    resp = await _query_agent(
+        conversation_id=conversation_id,
+        stage="stage4",
+        agent=chairman_agent
+        if chairman_agent
+        else AgentConfig(id="report", name="Report", model_spec=chairman_spec),
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        timeout=240.0,
+    )
+
+    report_md = ((resp or {}).get("content") or "").strip()
+    if not report_md:
+        if conversation_id:
+            trace_append(conversation_id, {"type": "stage_complete", "stage": "stage4", "ok": False})
+        return None
+
+    # Persist to KB (optional)
+    kb_doc_id = None
+    if settings.auto_save_report_to_kb:
+        conv = get_conversation(conversation_id) or {}
+        title = f"讨论报告：{conv.get('title') or conversation_id}"
+        enabled_agent_ids = [a.id for a in agents if a.enabled]
+        kb_doc_id = await _save_report_to_kb(
+            conversation_id=conversation_id,
+            title=title,
+            report_markdown=report_md,
+            category=(settings.report_kb_category or "council_reports"),
+            agent_ids=enabled_agent_ids,
+        )
+        if kb_doc_id and settings.auto_bind_report_to_conversation:
+            existing = _get_conversation_kb_doc_ids(conversation_id)
+            storage_ids = existing + [kb_doc_id]
+            # De-dupe preserving order
+            seen = set()
+            unique = []
+            for d in storage_ids:
+                if d in seen:
+                    continue
+                seen.add(d)
+                unique.append(d)
+            try:
+                # Avoid circular import by local import
+                from . import storage as _storage
+
+                _storage.update_conversation_kb_doc_ids(conversation_id, unique)
+            except Exception:
+                pass
+
+    out = {"model": chairman_spec, "report_markdown": report_md, "kb_doc_id": kb_doc_id}
+    if conversation_id:
+        trace_append(conversation_id, {"type": "stage_complete", "stage": "stage4", "ok": True, "kb_doc_id": kb_doc_id})
+    return out
+
+
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
@@ -1040,12 +1213,24 @@ async def run_full_council(user_query: str, conversation_id: str | None = None) 
         conversation_id=conversation_id,
     )
 
+    report = await stage4_generate_report(
+        user_query,
+        stage0=preprocess,
+        stage1_results=stage1_results,
+        stage2_results=stage2_results,
+        roundtable=roundtable,
+        fact_check=fact_check,
+        stage3_result=stage3_result,
+        conversation_id=conversation_id,
+    )
+
     metadata = {
         "label_to_agent": label_to_agent,
         "aggregate_rankings": aggregate_rankings,
         "preprocess": preprocess,
         "roundtable": roundtable,
         "fact_check": fact_check,
+        "report": report,
         "agents_snapshot": [
             {
                 "id": a.id,

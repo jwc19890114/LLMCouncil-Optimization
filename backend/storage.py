@@ -41,6 +41,7 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
         "chairman_model": "",
         "chairman_agent_id": "",
         "kb_doc_ids": [],
+        "report_requirements": "",
         "messages": []
     }
 
@@ -81,6 +82,8 @@ def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
             conv["chairman_agent_id"] = ""
         if "kb_doc_ids" not in conv or conv.get("kb_doc_ids") is None:
             conv["kb_doc_ids"] = []
+        if "report_requirements" not in conv or conv.get("report_requirements") is None:
+            conv["report_requirements"] = ""
     return conv
 
 
@@ -162,7 +165,13 @@ def add_assistant_message(
     conversation_id: str,
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
-    stage3: Dict[str, Any]
+    stage3: Dict[str, Any],
+    *,
+    stage0: Any = None,
+    stage2b: Any = None,
+    stage2c: Any = None,
+    stage4: Any = None,
+    metadata: Any = None,
 ):
     """
     Add an assistant message with all 3 stages to a conversation.
@@ -179,9 +188,14 @@ def add_assistant_message(
 
     conversation["messages"].append({
         "role": "assistant",
+        "stage0": stage0,
         "stage1": stage1,
         "stage2": stage2,
-        "stage3": stage3
+        "stage2b": stage2b,
+        "stage2c": stage2c,
+        "stage3": stage3,
+        "stage4": stage4,
+        "metadata": metadata,
     })
 
     save_conversation(conversation)
@@ -228,6 +242,14 @@ def update_conversation_kb_doc_ids(conversation_id: str, doc_ids: List[str]):
         seen.add(d)
         unique.append(d)
     conversation["kb_doc_ids"] = unique
+    save_conversation(conversation)
+
+
+def update_conversation_report_requirements(conversation_id: str, report_requirements: str):
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+    conversation["report_requirements"] = str(report_requirements or "").strip()
     save_conversation(conversation)
 
 
