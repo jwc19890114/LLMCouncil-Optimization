@@ -595,6 +595,7 @@ async def generate_conversation_title(user_query: str, conversation_id: str | No
     """Generate a short title for a conversation based on the first user message."""
     models = get_agent_models()
     title_spec = models["title_model"]
+    chairman_spec = models.get("chairman_model") or ""
 
     settings = get_settings()
     if settings.output_language == "zh":
@@ -612,14 +613,34 @@ Question: {user_query}
 Title:"""
 
     agents = list_agents()
-    title_agent = next((a for a in agents if a.model_spec == title_spec), None)
-    resp = await _query_agent(
-        conversation_id=conversation_id,
-        stage="title",
-        agent=title_agent if title_agent else AgentConfig(id="title", name="Title", model_spec=title_spec),
-        messages=[{"role": "user", "content": title_prompt}],
-        timeout=30.0,
-    )
+
+    def _spec_is_usable(spec: str) -> bool:
+        if not spec or not spec.strip():
+            return False
+        parsed = parse_model_spec(spec)
+        configured = provider_key_configured(parsed.provider)
+        return configured is not False
+
+    # Prefer configured title model; fall back to chairman, then to any configured agent model.
+    candidate_specs: List[str] = []
+    for spec in [title_spec, chairman_spec] + [a.model_spec for a in agents]:
+        if spec and spec not in candidate_specs:
+            candidate_specs.append(spec)
+
+    candidate_specs = [s for s in candidate_specs if _spec_is_usable(s)]
+
+    resp = None
+    for spec in candidate_specs:
+        title_agent = next((a for a in agents if a.model_spec == spec), None)
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="title",
+            agent=title_agent if title_agent else AgentConfig(id="title", name="Title", model_spec=spec),
+            messages=[{"role": "user", "content": title_prompt}],
+            timeout=30.0,
+        )
+        if resp is not None:
+            break
 
     if resp is None:
         return "New Conversation"
