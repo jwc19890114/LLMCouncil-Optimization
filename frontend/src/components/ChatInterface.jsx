@@ -24,6 +24,7 @@ export default function ChatInterface({
 }) {
   const [input, setInput] = useState('');
   const [uploadError, setUploadError] = useState('');
+  const [uploadNotice, setUploadNotice] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [isReportReqOpen, setIsReportReqOpen] = useState(false);
   const [reportRequirementsDraft, setReportRequirementsDraft] = useState('');
@@ -91,6 +92,7 @@ export default function ChatInterface({
   async function handleUploadTextFile(file) {
     if (!conversation?.id || !file) return;
     setUploadError('');
+    setUploadNotice('');
     setIsUploading(true);
     try {
       const sizeLimit = 5 * 1024 * 1024;
@@ -122,21 +124,23 @@ export default function ChatInterface({
         await onRefreshConversation();
       }
 
-      const ok = confirm(`已上传并绑定到当前会话：${title}\n\n是否立即让专家委员会对该文档做“摘要/要点/风险/建议”的讨论解读？`);
-      if (ok) {
-        onSendMessage(
-          `请对我上传的文本文件《${title}》进行分析讨论与解读：\n` +
-            `1) 用 5~10 句话给出摘要\n` +
-            `2) 列出关键要点（条目化）\n` +
-            `3) 识别潜在问题/风险/逻辑漏洞（如有）\n` +
-            `4) 给出可执行的改进建议与下一步行动`
-        );
-      }
+      setUploadNotice(`已上传并绑定到当前会话：${title}。你可以继续补充你的讨论要求后再发送。`);
+      const template =
+        `基于我上传的背景资料《${title}》，请按以下要求进行讨论与解读：\n` +
+        `1) \n` +
+        `2) \n` +
+        `3) \n`;
+      setInput((prev) => {
+        const cur = (prev || '').trim();
+        if (!cur) return template;
+        return `${cur}\n\n${template}`;
+      });
     } catch (e) {
       setUploadError(e?.message || '上传失败');
     } finally {
       setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
+      setTimeout(() => setUploadNotice(''), 6000);
     }
   }
 
@@ -216,6 +220,8 @@ export default function ChatInterface({
           </button>
         </div>
       </div>
+
+      {uploadNotice ? <div className="chat-notice">{uploadNotice}</div> : null}
 
       {isReportReqOpen && (
         <div className="chat-modal-overlay" onClick={() => setIsReportReqOpen(false)}>

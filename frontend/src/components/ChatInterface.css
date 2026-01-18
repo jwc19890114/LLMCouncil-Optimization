@@ -15,6 +15,15 @@
   background: #fafafa;
 }
 
+.chat-notice {
+  border-bottom: 1px solid #e0e0e0;
+  background: #f0f9ff;
+  color: #075985;
+  padding: 10px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .chat-title {
   font-weight: 700;
   color: #333;
