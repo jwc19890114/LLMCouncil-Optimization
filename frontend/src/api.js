@@ -92,6 +92,23 @@ export const api = {
     return response.json();
   },
 
+  // Settings
+  async getSettings() {
+    const response = await fetch(`${API_BASE}/api/settings`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '加载设置失败'));
+    return response.json();
+  },
+
+  async patchSettings(patch) {
+    const response = await fetch(`${API_BASE}/api/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch || {}),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '保存设置失败'));
+    return response.json();
+  },
+
   /**
    * List all conversations.
    */

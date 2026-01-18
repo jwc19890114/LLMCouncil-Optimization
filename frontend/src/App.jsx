@@ -5,6 +5,7 @@ import AgentsModal from './components/AgentsModal';
 import ConversationAgentsModal from './components/ConversationAgentsModal';
 import KnowledgeBasePage from './components/KnowledgeBasePage';
 import GraphPage from './components/GraphPage';
+import SettingsModal from './components/SettingsModal';
 import { api } from './api';
 import './App.css';
 
@@ -16,6 +17,7 @@ function App() {
   const [status, setStatus] = useState(null);
   const [isAgentsOpen, setIsAgentsOpen] = useState(false);
   const [isConversationAgentsOpen, setIsConversationAgentsOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [activeView, setActiveView] = useState('chat'); // chat | kb | graph
 
   async function loadConversations() {
@@ -339,6 +341,7 @@ function App() {
         onDeleteConversation={handleDeleteConversation}
         onExportConversation={handleExportConversation}
         onManageAgents={() => setIsAgentsOpen(true)}
+        onManageSettings={() => setIsSettingsOpen(true)}
         activeView={activeView}
         onManageKnowledgeBase={() => setActiveView('kb')}
         onShowChat={() => setActiveView('chat')}
@@ -409,6 +412,7 @@ function App() {
         onClose={() => setIsAgentsOpen(false)}
         onChanged={loadStatus}
       />
+      <SettingsModal open={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
       {isConversationAgentsOpen && (
         <ConversationAgentsModal
           onClose={() => setIsConversationAgentsOpen(false)}

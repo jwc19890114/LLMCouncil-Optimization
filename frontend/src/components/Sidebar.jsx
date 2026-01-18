@@ -12,6 +12,7 @@ export default function Sidebar({
   activeView,
   onManageAgents,
   onManageKnowledgeBase,
+  onManageSettings,
   onShowChat,
   onShowGraph,
 }) {
@@ -66,6 +67,9 @@ export default function Sidebar({
               </button>
               <button className="agents-btn" onClick={onShowGraph}>
                 图谱
+              </button>
+              <button className="agents-btn" onClick={onManageSettings}>
+                流程设置
               </button>
             </div>
           </div>
