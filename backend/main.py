@@ -353,6 +353,46 @@ kb_retriever = KBHybridRetriever(kb)
 async def kb_list_documents():
     return {"documents": kb.list_documents()}
 
+
+# NOTE: This route must be declared before "/api/kb/documents/{doc_id}" routes,
+# otherwise "batch" will be captured as a doc_id and POST will return 405.
+@app.post("/api/kb/documents/batch")
+async def kb_add_documents_batch(request: KBAddBatchRequest):
+    import uuid as _uuid
+
+    settings = settings_store.get_settings()
+    results: List[Dict[str, Any]] = []
+    ok_doc_ids: List[str] = []
+
+    for d in request.documents or []:
+        doc_id = d.id or _uuid.uuid4().hex
+        try:
+            r = kb.add_document(
+                doc_id=doc_id,
+                title=d.title,
+                source=d.source or "",
+                text=d.text,
+                categories=d.categories or [],
+                agent_ids=d.agent_ids or [],
+            )
+            ok_doc_ids.append(doc_id)
+            results.append({"ok": True, **r})
+        except Exception as e:
+            results.append({"ok": False, "doc_id": doc_id, "error": str(e)})
+
+    model = (request.embedding_model or settings.kb_embedding_model or "").strip()
+    should_index = request.index_embeddings if request.index_embeddings is not None else bool(model)
+    embeddings = None
+    if should_index and model and ok_doc_ids:
+        embeddings = await kb_retriever.index_embeddings(
+            embedding_model_spec=model,
+            doc_ids=ok_doc_ids,
+            pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+        )
+
+    return {"ok": True, "results": results, "embeddings": embeddings}
+
+
 @app.get("/api/kb/documents/{doc_id}")
 async def kb_get_document(doc_id: str):
     doc = kb.get_document(doc_id)
@@ -410,43 +450,6 @@ async def kb_add_document(request: KBAddRequest):
         )
 
     return {"ok": True, **result, "embeddings": embeddings}
-
-
-@app.post("/api/kb/documents/batch")
-async def kb_add_documents_batch(request: KBAddBatchRequest):
-    import uuid as _uuid
-
-    settings = settings_store.get_settings()
-    results: List[Dict[str, Any]] = []
-    ok_doc_ids: List[str] = []
-
-    for d in request.documents or []:
-        doc_id = d.id or _uuid.uuid4().hex
-        try:
-            r = kb.add_document(
-                doc_id=doc_id,
-                title=d.title,
-                source=d.source or "",
-                text=d.text,
-                categories=d.categories or [],
-                agent_ids=d.agent_ids or [],
-            )
-            ok_doc_ids.append(doc_id)
-            results.append({"ok": True, **r})
-        except Exception as e:
-            results.append({"ok": False, "doc_id": doc_id, "error": str(e)})
-
-    model = (request.embedding_model or settings.kb_embedding_model or "").strip()
-    should_index = request.index_embeddings if request.index_embeddings is not None else bool(model)
-    embeddings = None
-    if should_index and model and ok_doc_ids:
-        embeddings = await kb_retriever.index_embeddings(
-            embedding_model_spec=model,
-            doc_ids=ok_doc_ids,
-            pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
-        )
-
-    return {"ok": True, "results": results, "embeddings": embeddings}
 
 
 @app.delete("/api/kb/documents/{doc_id}")
