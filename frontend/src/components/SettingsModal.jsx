@@ -14,6 +14,18 @@ function normalizeAgentSearchResults(v) {
   return Math.max(0, Math.min(10, Math.trunc(n)));
 }
 
+function normalizeIntervalSeconds(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 10;
+  return Math.max(2, Math.min(3600, Math.trunc(n)));
+}
+
+function normalizeMaxFileMb(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 20;
+  return Math.max(1, Math.min(500, Math.trunc(n)));
+}
+
 export default function SettingsModal({ open, onClose }) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
@@ -60,6 +72,12 @@ export default function SettingsModal({ open, onClose }) {
         auto_save_report_to_kb: Boolean(settings.auto_save_report_to_kb),
         auto_bind_report_to_conversation: Boolean(settings.auto_bind_report_to_conversation),
         report_kb_category: String(settings.report_kb_category || ''),
+        kb_watch_enable: Boolean(settings.kb_watch_enable),
+        kb_watch_roots: Array.isArray(settings.kb_watch_roots) ? settings.kb_watch_roots : [],
+        kb_watch_exts: Array.isArray(settings.kb_watch_exts) ? settings.kb_watch_exts : [],
+        kb_watch_interval_seconds: normalizeIntervalSeconds(settings.kb_watch_interval_seconds),
+        kb_watch_max_file_mb: normalizeMaxFileMb(settings.kb_watch_max_file_mb),
+        kb_watch_index_embeddings: Boolean(settings.kb_watch_index_embeddings),
       };
       const resp = await api.patchSettings(patch);
       setSettings(resp?.settings || settings);
@@ -173,6 +191,98 @@ export default function SettingsModal({ open, onClose }) {
                 }
               />
               <span>启用阶段 2C：事实核查（输出结构化 JSON）</span>
+            </label>
+
+            <div className="settings-divider" />
+
+            <div className="settings-section-title">知识库：持续导入</div>
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.kb_watch_enable)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, kb_watch_enable: e.target.checked }))
+                }
+              />
+              <span>开启文件夹监听：自动将新增/修改文件落盘到知识库</span>
+            </label>
+
+            <div className="settings-row-textarea">
+              <div className="settings-label">监听目录（每行一个）</div>
+              <textarea
+                value={(settings.kb_watch_roots || []).join('\n')}
+                onChange={(e) => {
+                  const roots = String(e.target.value || '')
+                    .split('\n')
+                    .map((x) => x.trim())
+                    .filter(Boolean);
+                  setSettings((prev) => ({ ...prev, kb_watch_roots: roots }));
+                }}
+                rows={3}
+                disabled={!settings.kb_watch_enable}
+                placeholder="例如：data/kb_watch"
+              />
+            </div>
+
+            <div className="settings-row-inline">
+              <div className="settings-label">扩展名</div>
+              <input
+                value={(settings.kb_watch_exts || []).join(',')}
+                onChange={(e) => {
+                  const exts = String(e.target.value || '')
+                    .split(',')
+                    .map((x) => x.trim().replace(/^\./, '').toLowerCase())
+                    .filter(Boolean);
+                  setSettings((prev) => ({ ...prev, kb_watch_exts: exts }));
+                }}
+                disabled={!settings.kb_watch_enable}
+              />
+              <div className="settings-hint-inline">默认：txt,md（也可加 json/log）</div>
+            </div>
+
+            <div className="settings-row-inline">
+              <div className="settings-label">扫描间隔（秒）</div>
+              <input
+                type="number"
+                value={normalizeIntervalSeconds(settings.kb_watch_interval_seconds)}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    kb_watch_interval_seconds: normalizeIntervalSeconds(e.target.value),
+                  }))
+                }
+                disabled={!settings.kb_watch_enable}
+              />
+              <div className="settings-hint-inline">更小更实时，但更耗资源</div>
+            </div>
+
+            <div className="settings-row-inline">
+              <div className="settings-label">单文件上限（MB）</div>
+              <input
+                type="number"
+                value={normalizeMaxFileMb(settings.kb_watch_max_file_mb)}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    kb_watch_max_file_mb: normalizeMaxFileMb(e.target.value),
+                  }))
+                }
+                disabled={!settings.kb_watch_enable}
+              />
+              <div className="settings-hint-inline">避免误导入超大文件</div>
+            </div>
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.kb_watch_index_embeddings)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, kb_watch_index_embeddings: e.target.checked }))
+                }
+                disabled={!settings.kb_watch_enable}
+              />
+              <span>导入后自动建立 embedding（需要配置 KB_EMBEDDING_MODEL）</span>
             </label>
 
             <div className="settings-divider" />

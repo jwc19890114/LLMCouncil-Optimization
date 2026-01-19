@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
+import Markdown from './Markdown';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
@@ -30,6 +30,14 @@ export default function ChatInterface({
   const [isInvoking, setIsInvoking] = useState(false);
   const [isReportReqOpen, setIsReportReqOpen] = useState(false);
   const [reportRequirementsDraft, setReportRequirementsDraft] = useState('');
+  const [isDiscussionOpen, setIsDiscussionOpen] = useState(false);
+  const [discussionDraft, setDiscussionDraft] = useState(null);
+  const [isJobsOpen, setIsJobsOpen] = useState(false);
+  const [jobs, setJobs] = useState([]);
+  const [jobsError, setJobsError] = useState('');
+  const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
+  const [evidenceQuery, setEvidenceQuery] = useState('');
+  const [evidenceMode, setEvidenceMode] = useState('evidence_pack'); // web_search | evidence_pack
   const [trace, setTrace] = useState([]);
   const [showTrace, setShowTrace] = useState(false);
   const [traceError, setTraceError] = useState('');
@@ -79,6 +87,36 @@ export default function ChatInterface({
       cancelled = true;
     };
   }, [conversation?.id]);
+
+  useEffect(() => {
+    if (!isJobsOpen) return;
+    if (!conversation?.id) return;
+    let cancelled = false;
+    setJobsError('');
+    api
+      .listJobs({ conversation_id: conversation.id, limit: 50 })
+      .then((r) => {
+        if (cancelled) return;
+        setJobs(r?.jobs || []);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setJobsError(e?.message || '加载任务失败');
+      });
+    const timer = setInterval(() => {
+      api
+        .listJobs({ conversation_id: conversation.id, limit: 50 })
+        .then((r) => {
+          if (cancelled) return;
+          setJobs(r?.jobs || []);
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [isJobsOpen, conversation?.id]);
 
   function parseSlashContext(text) {
     const v = String(text || '');
@@ -294,42 +332,38 @@ export default function ChatInterface({
     return (
       <div className="chat-interface">
         <div className="empty-state">
-          <h2>欢迎使用 LLM Council</h2>
+          <h2>欢迎使用 SynthesisLab</h2>
           <p>请先新建一个会话开始</p>
         </div>
       </div>
     );
   }
 
-  async function handleUploadTextFile(file) {
+  async function handleUploadFile(file) {
     if (!conversation?.id || !file) return;
     setUploadError('');
     setUploadNotice('');
     setIsUploading(true);
     try {
-      const sizeLimit = 5 * 1024 * 1024;
+      const sizeLimit = 20 * 1024 * 1024;
       if (file.size > sizeLimit) {
-        throw new Error('文件过大（限制 5MB），请先裁剪后再上传');
+        throw new Error('文件过大（限制 20MB），请先裁剪后再上传');
       }
-      const text = await file.text();
-      if (!text.trim()) throw new Error('文件内容为空');
 
-      const title = file.name || 'uploaded.txt';
+      const title = file.name || 'uploaded';
       const source = `upload:${title}`;
 
-      const created = await api.addKBDocument({
-        title,
-        source,
-        text,
-        categories: ['upload'],
-        agent_ids: [],
-      });
+      const form = new FormData();
+      form.append('file', file);
+      form.append('conversation_id', conversation.id);
+      form.append('title', title);
+      form.append('source', source);
+      form.append('categories_json', JSON.stringify(['upload']));
+      form.append('agent_ids_json', JSON.stringify([]));
+
+      const created = await api.uploadKBDocumentFile(form);
       const docId = created?.doc_id;
       if (!docId) throw new Error('上传失败：未返回 doc_id');
-
-      const existing = Array.isArray(conversation?.kb_doc_ids) ? conversation.kb_doc_ids : [];
-      const next = Array.from(new Set([...existing, docId]));
-      await api.setConversationKBDocIds(conversation.id, next);
 
       // Optional: refresh conversation in parent if provided.
       if (typeof onRefreshConversation === 'function') {
@@ -366,20 +400,20 @@ export default function ChatInterface({
           <input
             ref={fileInputRef}
             type="file"
-            accept="text/*,.txt,.md,.json,.csv"
+            accept=".txt,.md,.json,.csv,.docx,.xlsx,text/*"
             style={{ display: 'none' }}
             onChange={(e) => {
               const f = e.target.files?.[0];
-              if (f) handleUploadTextFile(f);
+              if (f) handleUploadFile(f);
             }}
           />
           <button
             className="toolbar-btn"
             onClick={() => fileInputRef.current?.click()}
             disabled={isLoading || isUploading}
-            title="上传文本文件并绑定到当前会话"
+            title="上传文档并绑定到当前会话（支持 txt/md/docx/xlsx）"
           >
-            {isUploading ? '上传中...' : '上传文本'}
+            {isUploading ? '上传中...' : '上传文档'}
           </button>
           {Array.isArray(chairmanOptions) && chairmanOptions.length > 0 ? (
             <select
@@ -426,6 +460,37 @@ export default function ChatInterface({
             title="设置本会话的报告撰写要求（用于阶段4报告）"
           >
             报告要求
+          </button>
+          <button
+            className="toolbar-btn"
+            onClick={() => {
+              setDiscussionDraft({
+                discussion_mode: conversation?.discussion_mode || 'serious',
+                serious_iteration_rounds: Number(conversation?.serious_iteration_rounds || 1),
+                lively_script: conversation?.lively_script || 'groupchat',
+                lively_max_messages: Number(conversation?.lively_max_messages || 24),
+                lively_max_turns: Number(conversation?.lively_max_turns || 6),
+              });
+              setIsDiscussionOpen(true);
+            }}
+            disabled={isLoading || isUploading}
+            title="设置严肃/活力讨论模式与轮数/剧本/安全上限"
+          >
+            讨论模式
+          </button>
+          <button className="toolbar-btn" onClick={() => setIsJobsOpen(true)} disabled={isLoading || isUploading}>
+            任务
+          </button>
+          <button
+            className="toolbar-btn"
+            onClick={() => {
+              setEvidenceQuery('');
+              setEvidenceMode('evidence_pack');
+              setIsEvidenceOpen(true);
+            }}
+            disabled={isLoading || isUploading}
+          >
+            证据
           </button>
           <button className="toolbar-btn" onClick={onExportConversation}>
             导出
@@ -476,6 +541,243 @@ export default function ChatInterface({
                 disabled={isLoading}
               >
                 保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isDiscussionOpen && discussionDraft && (
+        <div className="chat-modal-overlay" onClick={() => setIsDiscussionOpen(false)}>
+          <div className="chat-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-modal-header">
+              <div className="chat-modal-title">讨论模式（本会话）</div>
+              <button className="chat-modal-close" onClick={() => setIsDiscussionOpen(false)}>
+                ✕
+              </button>
+            </div>
+            <div className="chat-modal-body">
+              <div className="chat-modal-hint">
+                严肃模式：按“报告迭代轮数”自动多轮讨论并产出最终报告。活力模式：自由流群聊，Chairman 可中途切换剧本，但受安全上限约束。
+              </div>
+
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">模式</div>
+                <select
+                  className="chat-modal-input"
+                  value={discussionDraft.discussion_mode || 'serious'}
+                  onChange={(e) =>
+                    setDiscussionDraft((p) => ({ ...p, discussion_mode: e.target.value || 'serious' }))
+                  }
+                >
+                  <option value="serious">严肃模式（报告迭代）</option>
+                  <option value="lively">活力模式（自由流群聊）</option>
+                </select>
+              </div>
+
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">报告迭代轮数</div>
+                <select
+                  className="chat-modal-input"
+                  value={Math.max(1, Math.min(8, Number(discussionDraft.serious_iteration_rounds || 1)))}
+                  onChange={(e) =>
+                    setDiscussionDraft((p) => ({
+                      ...p,
+                      serious_iteration_rounds: Math.max(1, Math.min(8, Number(e.target.value || 1))),
+                    }))
+                  }
+                  disabled={discussionDraft.discussion_mode !== 'serious'}
+                >
+                  {Array.from({ length: 8 }).map((_, i) => (
+                    <option key={i + 1} value={i + 1}>
+                      {i + 1}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">活力剧本</div>
+                <select
+                  className="chat-modal-input"
+                  value={discussionDraft.lively_script || 'groupchat'}
+                  onChange={(e) =>
+                    setDiscussionDraft((p) => ({ ...p, lively_script: e.target.value || 'groupchat' }))
+                  }
+                  disabled={discussionDraft.discussion_mode !== 'lively'}
+                >
+                  <option value="groupchat">普通群聊</option>
+                  <option value="brainstorm">头脑风暴</option>
+                  <option value="interview">角色扮演采访</option>
+                </select>
+              </div>
+
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">最大消息数</div>
+                <input
+                  className="chat-modal-input"
+                  type="number"
+                  value={Math.max(6, Math.min(200, Number(discussionDraft.lively_max_messages || 24)))}
+                  onChange={(e) =>
+                    setDiscussionDraft((p) => ({
+                      ...p,
+                      lively_max_messages: Math.max(6, Math.min(200, Number(e.target.value || 24))),
+                    }))
+                  }
+                  disabled={discussionDraft.discussion_mode !== 'lively'}
+                />
+              </div>
+
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">最大轮次</div>
+                <input
+                  className="chat-modal-input"
+                  type="number"
+                  value={Math.max(1, Math.min(50, Number(discussionDraft.lively_max_turns || 6)))}
+                  onChange={(e) =>
+                    setDiscussionDraft((p) => ({
+                      ...p,
+                      lively_max_turns: Math.max(1, Math.min(50, Number(e.target.value || 6))),
+                    }))
+                  }
+                  disabled={discussionDraft.discussion_mode !== 'lively'}
+                />
+              </div>
+            </div>
+            <div className="chat-modal-actions">
+              <button className="toolbar-btn" onClick={() => setIsDiscussionOpen(false)} disabled={isLoading}>
+                取消
+              </button>
+              <button
+                className="toolbar-btn primary"
+                onClick={async () => {
+                  try {
+                    await api.setConversationDiscussion(conversation.id, discussionDraft);
+                    await onRefreshConversation?.();
+                    setIsDiscussionOpen(false);
+                  } catch (err) {
+                    setUploadError(err?.message || '设置讨论模式失败');
+                  }
+                }}
+                disabled={isLoading}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isJobsOpen && (
+        <div className="chat-modal-overlay" onClick={() => setIsJobsOpen(false)}>
+          <div className="chat-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-modal-header">
+              <div className="chat-modal-title">后台任务（Jobs）</div>
+              <button className="chat-modal-close" onClick={() => setIsJobsOpen(false)}>
+                ✕
+              </button>
+            </div>
+            <div className="chat-modal-body">
+              {jobsError ? <div className="trace-error">{jobsError}</div> : null}
+              {jobs.length === 0 ? (
+                <div className="chat-modal-hint">暂无任务。</div>
+              ) : (
+                <div className="jobs-list">
+                  {jobs.slice(0, 50).map((j) => (
+                    <div key={j.id} className="jobs-item">
+                      <div className="jobs-meta">
+                        <span className="jobs-type">{j.job_type}</span>
+                        <span className="jobs-status">{j.status}</span>
+                        {typeof j.progress === 'number' ? (
+                          <span className="jobs-progress">{Math.round(j.progress * 100)}%</span>
+                        ) : null}
+                      </div>
+                      {j.result?.summary ? <div className="jobs-summary">{j.result.summary}</div> : null}
+                      {j.error ? <div className="trace-errorline">{j.error}</div> : null}
+                      {j.status === 'queued' || j.status === 'running' ? (
+                        <button
+                          className="toolbar-btn"
+                          onClick={async () => {
+                            try {
+                              await api.cancelJob(j.id);
+                            } catch (e) {
+                              setJobsError(e?.message || '取消任务失败');
+                            }
+                          }}
+                        >
+                          取消
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isEvidenceOpen && (
+        <div className="chat-modal-overlay" onClick={() => setIsEvidenceOpen(false)}>
+          <div className="chat-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-modal-header">
+              <div className="chat-modal-title">网页检索 / 证据整理</div>
+              <button className="chat-modal-close" onClick={() => setIsEvidenceOpen(false)}>
+                ✕
+              </button>
+            </div>
+            <div className="chat-modal-body">
+              <div className="chat-modal-hint">
+                网页检索：只拉取网页列表。证据整理：网页 + 当前会话已绑定的 KB 文档（FTS）一起整理，结果会作为后台任务回填到下一轮讨论上下文。
+              </div>
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">模式</div>
+                <select className="chat-modal-input" value={evidenceMode} onChange={(e) => setEvidenceMode(e.target.value)}>
+                  <option value="evidence_pack">证据整理（网页+KB）</option>
+                  <option value="web_search">网页检索</option>
+                </select>
+              </div>
+              <div className="chat-modal-row">
+                <div className="chat-modal-label">查询</div>
+                <input
+                  className="chat-modal-input"
+                  value={evidenceQuery}
+                  onChange={(e) => setEvidenceQuery(e.target.value)}
+                  placeholder="输入要检索/整理证据的关键词或问题"
+                />
+              </div>
+            </div>
+            <div className="chat-modal-actions">
+              <button className="toolbar-btn" onClick={() => setIsEvidenceOpen(false)} disabled={isLoading}>
+                取消
+              </button>
+              <button
+                className="toolbar-btn primary"
+                onClick={async () => {
+                  const q = String(evidenceQuery || '').trim();
+                  if (!q) {
+                    setUploadError('请输入查询内容');
+                    return;
+                  }
+                  try {
+                    await api.createJob({
+                      job_type: evidenceMode,
+                      conversation_id: conversation?.id || '',
+                      payload:
+                        evidenceMode === 'web_search'
+                          ? { query: q, max_results: 5 }
+                          : { query: q, max_web_results: 5, max_kb_chunks: 6 },
+                    });
+                    setIsEvidenceOpen(false);
+                    setUploadNotice('已创建后台任务，完成后会自动回填到下一轮讨论上下文，可在“任务”中查看进度。');
+                    setTimeout(() => setUploadNotice(''), 6000);
+                  } catch (err) {
+                    setUploadError(err?.message || '创建任务失败');
+                  }
+                }}
+                disabled={isLoading}
+              >
+                开始
               </button>
             </div>
           </div>
@@ -549,7 +851,7 @@ export default function ChatInterface({
                   <div className="message-label">你</div>
                   <div className="message-content">
                     <div className="markdown-content">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      <Markdown>{msg.content}</Markdown>
                     </div>
                   </div>
                 </div>
@@ -563,7 +865,7 @@ export default function ChatInterface({
                         单独发言：{msg.direct.agent_name || 'Agent'}
                       </div>
                       <div className="stage2b-content">
-                        <ReactMarkdown>{msg.direct.content || ''}</ReactMarkdown>
+                        <Markdown>{msg.direct.content || ''}</Markdown>
                       </div>
                     </div>
                   ) : null}
@@ -608,7 +910,13 @@ export default function ChatInterface({
                       <span>阶段 2B 进行中：圆桌讨论...</span>
                     </div>
                   )}
-                  {msg.stage2b && <Stage2b messages={msg.stage2b} />}
+                  {msg.stage2b && (
+                    <Stage2b
+                      messages={msg.stage2b}
+                      mode={msg.metadata?.discussion_mode || ''}
+                      livelyMeta={msg.metadata?.lively || null}
+                    />
+                  )}
 
                   {/* Stage 2C */}
                   {msg.loading?.stage2c && (
@@ -635,7 +943,7 @@ export default function ChatInterface({
                       <span>阶段 4 进行中：主席撰写完整报告...</span>
                     </div>
                   )}
-                  {msg.stage4 && <Stage4 report={msg.stage4} />}
+                  {msg.stage4 && <Stage4 report={msg.stage4} conversationId={conversation.id} onSaved={onRefreshConversation} />}
                 </div>
               )}
             </div>

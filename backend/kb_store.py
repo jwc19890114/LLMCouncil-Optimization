@@ -83,6 +83,22 @@ class KBStore:
 
                 CREATE INDEX IF NOT EXISTS kb_chunks_doc_id ON kb_chunks(doc_id);
                 CREATE INDEX IF NOT EXISTS kb_chunk_embeddings_model ON kb_chunk_embeddings(model_spec);
+
+                -- Track ingested source files for continuous KB import.
+                CREATE TABLE IF NOT EXISTS kb_source_files (
+                  path TEXT PRIMARY KEY,
+                  doc_id TEXT NOT NULL,
+                  sha256 TEXT NOT NULL,
+                  mtime REAL NOT NULL,
+                  size INTEGER NOT NULL,
+                  title TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  categories_json TEXT NOT NULL DEFAULT '[]',
+                  agent_ids_json TEXT NOT NULL DEFAULT '[]',
+                  updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS kb_source_files_doc_id ON kb_source_files(doc_id);
                 """
             )
             # Lightweight migration for older DBs.
@@ -183,6 +199,15 @@ class KBStore:
 
     def delete_document(self, doc_id: str) -> bool:
         with self._connect() as conn:
+            # Remove embeddings for chunks in this document (best-effort cleanup).
+            try:
+                rows = conn.execute("SELECT id FROM kb_chunks WHERE doc_id=?", (doc_id,)).fetchall()
+                chunk_ids = [r["id"] for r in rows]
+                if chunk_ids:
+                    placeholders = ",".join(["?"] * len(chunk_ids))
+                    conn.execute(f"DELETE FROM kb_chunk_embeddings WHERE chunk_id IN ({placeholders})", (*chunk_ids,))
+            except Exception:
+                pass
             conn.execute("DELETE FROM kb_chunks_fts WHERE doc_id=?", (doc_id,))
             cur = conn.execute("DELETE FROM kb_documents WHERE id=?", (doc_id,))
             return cur.rowcount > 0
@@ -388,6 +413,117 @@ class KBStore:
                     (chunk_id, model_spec, json.dumps(vec), created_at),
                 )
         return len(items)
+
+    def get_source_file(self, path: str) -> Optional[Dict[str, Any]]:
+        import json
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT path,doc_id,sha256,mtime,size,title,source,categories_json,agent_ids_json,updated_at FROM kb_source_files WHERE path=?",
+                (path,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "path": row["path"],
+            "doc_id": row["doc_id"],
+            "sha256": row["sha256"],
+            "mtime": float(row["mtime"]),
+            "size": int(row["size"]),
+            "title": row["title"],
+            "source": row["source"],
+            "categories": json.loads(row["categories_json"] or "[]"),
+            "agent_ids": json.loads(row["agent_ids_json"] or "[]"),
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_source_file(
+        self,
+        *,
+        path: str,
+        doc_id: str,
+        sha256: str,
+        mtime: float,
+        size: int,
+        title: str,
+        source: str,
+        categories: Optional[List[str]] = None,
+        agent_ids: Optional[List[str]] = None,
+    ) -> None:
+        import json
+
+        categories = categories or []
+        agent_ids = agent_ids or []
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO kb_source_files(path,doc_id,sha256,mtime,size,title,source,categories_json,agent_ids_json,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET
+                  doc_id=excluded.doc_id,
+                  sha256=excluded.sha256,
+                  mtime=excluded.mtime,
+                  size=excluded.size,
+                  title=excluded.title,
+                  source=excluded.source,
+                  categories_json=excluded.categories_json,
+                  agent_ids_json=excluded.agent_ids_json,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    path,
+                    doc_id,
+                    sha256,
+                    float(mtime),
+                    int(size),
+                    title,
+                    source,
+                    json.dumps(categories, ensure_ascii=False),
+                    json.dumps(agent_ids, ensure_ascii=False),
+                    updated_at,
+                ),
+            )
+
+    def delete_source_file(self, path: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM kb_source_files WHERE path=?", (path,))
+            return cur.rowcount > 0
+
+    def list_source_files(self, *, roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        import json
+
+        roots = [r for r in (roots or []) if (r or "").strip()]
+        with self._connect() as conn:
+            if not roots:
+                rows = conn.execute(
+                    "SELECT path,doc_id,sha256,mtime,size,title,source,categories_json,agent_ids_json,updated_at FROM kb_source_files"
+                ).fetchall()
+            else:
+                where = " OR ".join(["path LIKE ?"] * len(roots))
+                params = [f"{r}%" for r in roots]
+                rows = conn.execute(
+                    f"SELECT path,doc_id,sha256,mtime,size,title,source,categories_json,agent_ids_json,updated_at FROM kb_source_files WHERE {where}",
+                    (*params,),
+                ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "path": r["path"],
+                    "doc_id": r["doc_id"],
+                    "sha256": r["sha256"],
+                    "mtime": float(r["mtime"]),
+                    "size": int(r["size"]),
+                    "title": r["title"],
+                    "source": r["source"],
+                    "categories": json.loads(r["categories_json"] or "[]"),
+                    "agent_ids": json.loads(r["agent_ids_json"] or "[]"),
+                    "updated_at": r["updated_at"],
+                }
+            )
+        return out
 
 
 def _chunk_text(text: str, *, chunk_size: int, overlap: int) -> List[str]:

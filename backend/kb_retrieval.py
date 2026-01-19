@@ -51,7 +51,7 @@ class KBHybridRetriever:
         if not chunks:
             return []
 
-        qvecs = await embed_texts(embedding_model_spec, [query])
+        qvecs = await embed_texts(embedding_model_spec, [query], silent=True)
         if not qvecs or not qvecs[0]:
             return []
         qvec = qvecs[0]
@@ -68,7 +68,7 @@ class KBHybridRetriever:
             for i in range(0, len(missing), batch_size):
                 batch_ids = missing[i : i + batch_size]
                 batch_texts = [id_to_text.get(cid, "") for cid in batch_ids]
-                vecs = await embed_texts(embedding_model_spec, batch_texts)
+                vecs = await embed_texts(embedding_model_spec, batch_texts, silent=True)
                 if not vecs or len(vecs) != len(batch_ids):
                     continue
                 for cid, v in zip(batch_ids, vecs):

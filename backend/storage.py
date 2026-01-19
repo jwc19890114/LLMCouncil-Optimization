@@ -42,6 +42,15 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
         "chairman_agent_id": "",
         "kb_doc_ids": [],
         "report_requirements": "",
+        # Discussion mode + controls
+        # serious: staged process + report iteration rounds
+        # lively: free-flow multi-agent chat with script switching + final report
+        "discussion_mode": "serious",
+        "serious_iteration_rounds": 1,
+        "lively_script": "groupchat",  # brainstorm | interview | groupchat
+        "lively_script_history": [],
+        "lively_max_messages": 24,
+        "lively_max_turns": 6,
         "messages": []
     }
 
@@ -84,6 +93,18 @@ def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
             conv["kb_doc_ids"] = []
         if "report_requirements" not in conv or conv.get("report_requirements") is None:
             conv["report_requirements"] = ""
+        if "discussion_mode" not in conv or conv.get("discussion_mode") is None:
+            conv["discussion_mode"] = "serious"
+        if "serious_iteration_rounds" not in conv or conv.get("serious_iteration_rounds") is None:
+            conv["serious_iteration_rounds"] = 1
+        if "lively_script" not in conv or conv.get("lively_script") is None:
+            conv["lively_script"] = "groupchat"
+        if "lively_script_history" not in conv or conv.get("lively_script_history") is None:
+            conv["lively_script_history"] = []
+        if "lively_max_messages" not in conv or conv.get("lively_max_messages") is None:
+            conv["lively_max_messages"] = 24
+        if "lively_max_turns" not in conv or conv.get("lively_max_turns") is None:
+            conv["lively_max_turns"] = 6
     return conv
 
 
@@ -311,4 +332,60 @@ def update_conversation_chairman_agent(conversation_id: str, chairman_agent_id: 
     if conversation is None:
         raise ValueError(f"Conversation {conversation_id} not found")
     conversation["chairman_agent_id"] = (chairman_agent_id or "").strip()
+    save_conversation(conversation)
+
+
+def update_conversation_discussion_config(
+    conversation_id: str,
+    *,
+    discussion_mode: str | None = None,
+    serious_iteration_rounds: int | None = None,
+    lively_script: str | None = None,
+    lively_max_messages: int | None = None,
+    lively_max_turns: int | None = None,
+    lively_script_history_append: dict | None = None,
+):
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    if discussion_mode is not None:
+        mode = str(discussion_mode or "").strip().lower()
+        if mode in ("serious", "lively"):
+            conversation["discussion_mode"] = mode
+
+    if serious_iteration_rounds is not None:
+        try:
+            n = int(serious_iteration_rounds)
+        except Exception:
+            n = 1
+        conversation["serious_iteration_rounds"] = max(1, min(8, n))
+
+    if lively_script is not None:
+        script = str(lively_script or "").strip().lower()
+        if script in ("brainstorm", "interview", "groupchat"):
+            conversation["lively_script"] = script
+
+    if lively_max_messages is not None:
+        try:
+            n = int(lively_max_messages)
+        except Exception:
+            n = 24
+        conversation["lively_max_messages"] = max(6, min(200, n))
+
+    if lively_max_turns is not None:
+        try:
+            n = int(lively_max_turns)
+        except Exception:
+            n = 6
+        conversation["lively_max_turns"] = max(1, min(50, n))
+
+    if lively_script_history_append is not None and isinstance(lively_script_history_append, dict):
+        hist = conversation.get("lively_script_history")
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(lively_script_history_append)
+        # Keep it bounded.
+        conversation["lively_script_history"] = hist[-200:]
+
     save_conversation(conversation)

@@ -39,6 +39,14 @@ class Settings:
     kb_semantic_pool: int = 2000
     kb_initial_k: int = 24
 
+    # Knowledge base continuous ingestion (watch folders + incremental import)
+    kb_watch_enable: bool = field(default_factory=lambda: bool(config.KB_WATCH_ENABLE))
+    kb_watch_roots: list[str] = field(default_factory=lambda: list(config.KB_WATCH_ROOTS or []))
+    kb_watch_exts: list[str] = field(default_factory=lambda: list(config.KB_WATCH_EXTS or ["txt", "md"]))
+    kb_watch_interval_seconds: int = field(default_factory=lambda: int(config.KB_WATCH_INTERVAL_SECONDS or 10))
+    kb_watch_max_file_mb: int = field(default_factory=lambda: int(config.KB_WATCH_MAX_FILE_MB or 20))
+    kb_watch_index_embeddings: bool = True
+
     # Council pipeline extensions
     enable_preprocess: bool = True
     enable_roundtable: bool = True
@@ -103,6 +111,12 @@ def get_settings() -> Settings:
         kb_rerank_model=str(data.get("kb_rerank_model", "") or ""),
         kb_semantic_pool=int(data.get("kb_semantic_pool", 2000)),
         kb_initial_k=int(data.get("kb_initial_k", 24)),
+        kb_watch_enable=bool(data.get("kb_watch_enable", bool(config.KB_WATCH_ENABLE))),
+        kb_watch_roots=list(data.get("kb_watch_roots", list(config.KB_WATCH_ROOTS or [])) or []),
+        kb_watch_exts=list(data.get("kb_watch_exts", list(config.KB_WATCH_EXTS or ["txt", "md"])) or []),
+        kb_watch_interval_seconds=max(2, int(data.get("kb_watch_interval_seconds", int(config.KB_WATCH_INTERVAL_SECONDS or 10)))),
+        kb_watch_max_file_mb=max(1, int(data.get("kb_watch_max_file_mb", int(config.KB_WATCH_MAX_FILE_MB or 20)))),
+        kb_watch_index_embeddings=bool(data.get("kb_watch_index_embeddings", True)),
         enable_preprocess=bool(data.get("enable_preprocess", True)),
         enable_roundtable=bool(data.get("enable_roundtable", True)),
         enable_fact_check=bool(data.get("enable_fact_check", True)),
@@ -121,6 +135,10 @@ def get_settings() -> Settings:
         s.kb_embedding_model = config.KB_EMBEDDING_MODEL
     if not s.kb_rerank_model and config.KB_RERANK_MODEL:
         s.kb_rerank_model = config.KB_RERANK_MODEL
+    if not s.kb_watch_roots and config.KB_WATCH_ROOTS:
+        s.kb_watch_roots = list(config.KB_WATCH_ROOTS)
+    if not s.kb_watch_exts and config.KB_WATCH_EXTS:
+        s.kb_watch_exts = list(config.KB_WATCH_EXTS)
     return s
 
 
@@ -165,6 +183,40 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
     if "kb_initial_k" in patch:
         s.kb_initial_k = max(1, min(200, int(patch["kb_initial_k"])))
 
+    if "kb_watch_enable" in patch:
+        s.kb_watch_enable = bool(patch["kb_watch_enable"])
+
+    if "kb_watch_roots" in patch:
+        roots = patch.get("kb_watch_roots") or []
+        if isinstance(roots, str):
+            roots = [r.strip() for r in roots.replace(";", ",").split(",") if r.strip()]
+        if isinstance(roots, list):
+            s.kb_watch_roots = [str(r).strip() for r in roots if str(r).strip()]
+
+    if "kb_watch_exts" in patch:
+        exts = patch.get("kb_watch_exts") or []
+        if isinstance(exts, str):
+            exts = [e.strip() for e in exts.split(",") if e.strip()]
+        if isinstance(exts, list):
+            cleaned: list[str] = []
+            seen = set()
+            for e in exts:
+                val = str(e).strip().lower().lstrip(".")
+                if not val or val in seen:
+                    continue
+                seen.add(val)
+                cleaned.append(val)
+            s.kb_watch_exts = cleaned
+
+    if "kb_watch_interval_seconds" in patch:
+        s.kb_watch_interval_seconds = max(2, min(3600, int(patch["kb_watch_interval_seconds"])))
+
+    if "kb_watch_max_file_mb" in patch:
+        s.kb_watch_max_file_mb = max(1, min(500, int(patch["kb_watch_max_file_mb"])))
+
+    if "kb_watch_index_embeddings" in patch:
+        s.kb_watch_index_embeddings = bool(patch["kb_watch_index_embeddings"])
+
     if "enable_preprocess" in patch:
         s.enable_preprocess = bool(patch["enable_preprocess"])
 
@@ -204,5 +256,9 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
         s.kb_embedding_model = config.KB_EMBEDDING_MODEL
     if not s.kb_rerank_model and config.KB_RERANK_MODEL:
         s.kb_rerank_model = config.KB_RERANK_MODEL
+    if not s.kb_watch_roots and config.KB_WATCH_ROOTS:
+        s.kb_watch_roots = list(config.KB_WATCH_ROOTS)
+    if not s.kb_watch_exts and config.KB_WATCH_EXTS:
+        s.kb_watch_exts = list(config.KB_WATCH_EXTS)
     _save_raw(asdict(s))
     return s

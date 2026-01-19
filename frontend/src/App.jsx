@@ -6,6 +6,7 @@ import ConversationAgentsModal from './components/ConversationAgentsModal';
 import KnowledgeBasePage from './components/KnowledgeBasePage';
 import GraphPage from './components/GraphPage';
 import SettingsModal from './components/SettingsModal';
+import PluginsPage from './components/PluginsPage';
 import { api } from './api';
 import './App.css';
 
@@ -18,7 +19,7 @@ function App() {
   const [isAgentsOpen, setIsAgentsOpen] = useState(false);
   const [isConversationAgentsOpen, setIsConversationAgentsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [activeView, setActiveView] = useState('chat'); // chat | kb | graph
+  const [activeView, setActiveView] = useState('chat'); // chat | kb | graph | plugins
 
   async function loadConversations() {
     try {
@@ -119,7 +120,7 @@ function App() {
     try {
       const data = await api.exportConversation(id);
       const title = data?.conversation?.title || id;
-      downloadJson(`llm-council-${title}-${id}.json`, data);
+      downloadJson(`synthesislab-${title}-${id}.json`, data);
     } catch (error) {
       console.error('Failed to export conversation:', error);
       alert(`导出失败：${error?.message || error}`);
@@ -247,6 +248,7 @@ function App() {
                 const messages = [...prev.messages];
                 const lastMsg = messages[messages.length - 1];
                 lastMsg.loading.stage2b = true;
+                lastMsg.metadata = { ...(lastMsg.metadata || {}), discussion_mode: event.mode || '' };
                 return { ...prev, messages };
               });
               break;
@@ -257,6 +259,7 @@ function App() {
                 const lastMsg = messages[messages.length - 1];
                 lastMsg.stage2b = event.data;
                 lastMsg.loading.stage2b = false;
+                lastMsg.metadata = { ...(lastMsg.metadata || {}), ...(event.metadata || {}), discussion_mode: event.mode || (lastMsg.metadata || {}).discussion_mode || '' };
                 return { ...prev, messages };
               });
               break;
@@ -363,6 +366,7 @@ function App() {
         onExportConversation={handleExportConversation}
         onManageAgents={() => setIsAgentsOpen(true)}
         onManageSettings={() => setIsSettingsOpen(true)}
+        onManagePlugins={() => setActiveView('plugins')}
         activeView={activeView}
         onManageKnowledgeBase={() => setActiveView('kb')}
         onShowChat={() => setActiveView('chat')}
@@ -370,6 +374,8 @@ function App() {
       />
       {activeView === 'kb' ? (
         <KnowledgeBasePage onBack={() => setActiveView('chat')} />
+      ) : activeView === 'plugins' ? (
+        <PluginsPage onBack={() => setActiveView('chat')} />
       ) : activeView === 'graph' ? (
         <GraphPage
           onBack={() => setActiveView('chat')}

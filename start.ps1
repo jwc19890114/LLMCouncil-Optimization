@@ -25,9 +25,10 @@ while (-not (Test-PortAvailable $backendPort)) {
 
 Write-Host "Starting backend on http://localhost:$backendPort..." -ForegroundColor Green
 $env:BACKEND_PORT = "$backendPort"
+$env:PYTHONPATH = if ($env:PYTHONPATH) { "$PSScriptRoot;$env:PYTHONPATH" } else { "$PSScriptRoot" }
 
 $uvCmd = (Get-Command uv -ErrorAction Stop).Source
-$backend = Start-Process -FilePath $uvCmd -ArgumentList @("run", "python", "-m", "backend.main") -PassThru -NoNewWindow
+$backend = Start-Process -FilePath $uvCmd -ArgumentList @("run", "python", "-m", "backend.main") -WorkingDirectory $PSScriptRoot -PassThru -NoNewWindow
 
 Start-Sleep -Seconds 2
 

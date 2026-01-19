@@ -2,6 +2,11 @@
 
 # LLM Council - Start script
 
+# Ensure we run from the repo root (important when the script is launched from elsewhere).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
 echo "Starting LLM Council..."
 echo ""
 

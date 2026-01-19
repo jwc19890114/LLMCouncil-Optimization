@@ -1,7 +1,7 @@
-"""FastAPI backend for LLM Council."""
+"""FastAPI backend for SynthesisLab."""
 
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -20,6 +20,7 @@ from .council import (
     stage1_collect_responses,
     stage2_collect_rankings,
     stage2b_roundtable,
+    stage2b_lively,
     stage2c_fact_check,
     stage3_synthesize_final,
     stage0_preprocess,
@@ -32,12 +33,17 @@ from .entity_type_normalizer import canonicalize_entity_type
 from .kg_extractor import DEFAULT_ONTOLOGY, extract_kg_incremental
 from .kg_interpret import build_components, interpret_entity, summarize_community
 from .neo4j_store import KGChunk, KGEntity, KGRelation, Neo4jKGStore
+from .jobs_store import JobsStore
+from .job_runner import JobRunner
+from .tool_context import ToolContext
+from .plugin_manager import PluginManager
+from .kb_store import KBStore
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
 
-app = FastAPI(title="LLM Council API", default_response_class=UTF8JSONResponse)
+app = FastAPI(title="SynthesisLab API", default_response_class=UTF8JSONResponse)
 
 # Enable CORS for local development
 app.add_middleware(
@@ -97,6 +103,12 @@ class SettingsPatchRequest(BaseModel):
     kb_rerank_model: Optional[str] = None
     kb_semantic_pool: Optional[int] = None
     kb_initial_k: Optional[int] = None
+    kb_watch_enable: Optional[bool] = None
+    kb_watch_roots: Optional[List[str]] = None
+    kb_watch_exts: Optional[List[str]] = None
+    kb_watch_interval_seconds: Optional[int] = None
+    kb_watch_max_file_mb: Optional[int] = None
+    kb_watch_index_embeddings: Optional[bool] = None
     enable_preprocess: Optional[bool] = None
     enable_roundtable: Optional[bool] = None
     enable_fact_check: Optional[bool] = None
@@ -108,6 +120,10 @@ class SettingsPatchRequest(BaseModel):
     report_kb_category: Optional[str] = None
     enable_history_context: Optional[bool] = None
     history_max_messages: Optional[int] = None
+
+class PluginPatchRequest(BaseModel):
+    enabled: Optional[bool] = None
+    config: Optional[Dict[str, Any]] = None
 
 
 class KBAddRequest(BaseModel):
@@ -137,6 +153,8 @@ class KBIndexRequest(BaseModel):
     categories: Optional[List[str]] = None
     embedding_model: Optional[str] = None
     pool: int = 5000
+    async_job: bool = False
+    conversation_id: str = ""
 
 
 class KBAddBatchRequest(BaseModel):
@@ -151,6 +169,8 @@ class KGExtractRequest(BaseModel):
     graph_id: str
     model_spec: Optional[str] = None
     ontology: Optional[Dict[str, Any]] = None
+    async_job: bool = False
+    conversation_id: str = ""
 
 
 class KGCreateRequest(BaseModel):
@@ -184,6 +204,12 @@ class Conversation(BaseModel):
     chairman_agent_id: str = ""
     kb_doc_ids: List[str] = []
     report_requirements: str = ""
+    discussion_mode: str = "serious"
+    serious_iteration_rounds: int = 1
+    lively_script: str = "groupchat"
+    lively_script_history: List[Dict[str, Any]] = []
+    lively_max_messages: int = 24
+    lively_max_turns: int = 6
     messages: List[Dict[str, Any]]
 
 
@@ -199,6 +225,13 @@ class ConversationChairmanRequest(BaseModel):
 class ConversationReportRequest(BaseModel):
     report_requirements: str = ""
 
+class ConversationDiscussionRequest(BaseModel):
+    discussion_mode: Optional[str] = None  # serious | lively
+    serious_iteration_rounds: Optional[int] = None
+    lively_script: Optional[str] = None  # brainstorm | interview | groupchat
+    lively_max_messages: Optional[int] = None
+    lively_max_turns: Optional[int] = None
+
 
 class ConversationInvokeRequest(BaseModel):
     action: str  # ask | report
@@ -206,11 +239,16 @@ class ConversationInvokeRequest(BaseModel):
     content: str = ""
     report_requirements: str = ""
 
+class JobCreateRequest(BaseModel):
+    job_type: str
+    conversation_id: str = ""
+    payload: Dict[str, Any] = {}
+
 
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    return {"status": "ok", "service": "LLM Council API"}
+    return {"status": "ok", "service": "SynthesisLab API"}
 
 
 @app.get("/api/status")
@@ -375,13 +413,71 @@ async def patch_settings(request: SettingsPatchRequest):
     return {"ok": True, "settings": s.__dict__}
 
 
+@app.get("/api/plugins")
+async def list_plugins():
+    return {"plugins": [p.__dict__ for p in plugin_manager.list_plugins()], "tools": plugin_manager.registry.list()}
+
+
+@app.put("/api/plugins/{name}")
+async def patch_plugin(name: str, request: PluginPatchRequest):
+    if request.enabled is None and request.config is None:
+        raise HTTPException(status_code=400, detail="No changes")
+    if request.enabled is not None:
+        plugin_manager.set_enabled(name, bool(request.enabled))
+    if request.config is not None:
+        plugin_manager.set_config(name, request.config or {})
+    job_runner.set_tools(plugin_manager.registry, tool_ctx)
+    return {
+        "ok": True,
+        "plugin": next((p.__dict__ for p in plugin_manager.list_plugins() if p.name == name), None),
+        "tools": plugin_manager.registry.list(),
+    }
+
+
+@app.post("/api/plugins/reload")
+async def reload_plugins():
+    plugin_manager.reload()
+    job_runner.set_tools(plugin_manager.registry, tool_ctx)
+    return {"ok": True, "plugins": [p.__dict__ for p in plugin_manager.list_plugins()], "tools": plugin_manager.registry.list()}
+
+
 kb = KBStore()
 kb_retriever = KBHybridRetriever(kb)
+from .kb_watch import KBWatchService
+
+kb_watch = KBWatchService(kb, kb_retriever)
+jobs_store = JobsStore()
+job_runner = JobRunner(jobs_store, workers=1)
+plugin_manager = PluginManager()
+tool_ctx = ToolContext(kb_retriever=kb_retriever, get_neo4j=lambda: _get_neo4j())
+
+
+@app.on_event("startup")
+async def _startup_tasks():
+    job_runner.set_tools(plugin_manager.registry, tool_ctx)
+    await job_runner.start()
+    await kb_watch.start()
+
+
+@app.on_event("shutdown")
+async def _shutdown_tasks():
+    await kb_watch.stop()
+    await job_runner.stop()
 
 
 @app.get("/api/kb/documents")
 async def kb_list_documents():
     return {"documents": kb.list_documents()}
+
+@app.get("/api/kb/watch/status")
+async def kb_watch_status():
+    return kb_watch.status().__dict__
+
+
+@app.post("/api/kb/watch/scan")
+async def kb_watch_scan():
+    # Run a scan immediately (best-effort).
+    return await kb_watch.scan_once()
 
 
 # NOTE: This route must be declared before "/api/kb/documents/{doc_id}" routes,
@@ -423,6 +519,126 @@ async def kb_add_documents_batch(request: KBAddBatchRequest):
     return {"ok": True, "results": results, "embeddings": embeddings}
 
 
+def _truthy_form(v: str) -> bool:
+    s = str(v or "").strip().lower()
+    return s in ("1", "true", "yes", "on", "y", "t")
+
+
+@app.post("/api/kb/documents/upload")
+async def kb_upload_document(
+    file: UploadFile = File(...),
+    conversation_id: str = Form(""),
+    title: str = Form(""),
+    source: str = Form(""),
+    categories_json: str = Form("[]"),
+    agent_ids_json: str = Form("[]"),
+    index_embeddings: str = Form(""),
+    embedding_model: str = Form(""),
+):
+    import json as _json
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    settings = settings_store.get_settings()
+    conversation_id = (conversation_id or "").strip()
+    if conversation_id and storage.get_conversation(conversation_id) is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    filename = (file.filename or "").strip() or "uploaded"
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    try:
+        categories = _json.loads(categories_json or "[]")
+        if not isinstance(categories, list):
+            categories = []
+    except Exception:
+        categories = []
+    categories = [str(x).strip() for x in (categories or []) if str(x).strip()]
+    if not categories:
+        categories = ["upload"]
+
+    try:
+        agent_ids = _json.loads(agent_ids_json or "[]")
+        if not isinstance(agent_ids, list):
+            agent_ids = []
+    except Exception:
+        agent_ids = []
+    agent_ids = [str(x).strip() for x in (agent_ids or []) if str(x).strip()]
+
+    content = await file.read()
+    max_bytes = int(getattr(settings, "kb_watch_max_file_mb", 20) or 20) * 1024 * 1024
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"File too large (limit {max_bytes // (1024*1024)}MB)")
+
+    # Extract text (best-effort)
+    text = ""
+    if ext in ("docx", "xlsx"):
+        try:
+            from .office_extract import extract_office_text
+
+            fd, tmp_path = _tempfile.mkstemp(prefix="kb_upload_", suffix="." + ext)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(content)
+                text = extract_office_text(_Path(tmp_path))
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Office extract failed: {e}")
+    else:
+        try:
+            decoded = content.decode("utf-8", errors="ignore")
+        except Exception:
+            decoded = ""
+        if ext == "json":
+            try:
+                obj = _json.loads(decoded)
+                text = _json.dumps(obj, ensure_ascii=False, indent=2)
+            except Exception:
+                text = decoded
+        else:
+            text = decoded
+
+    if not (text or "").strip():
+        raise HTTPException(status_code=400, detail="No text extracted from file")
+
+    # Create KB doc
+    doc_id = uuid.uuid4().hex
+    final_title = (title or "").strip() or (filename.rsplit(".", 1)[0] if "." in filename else filename) or filename
+    final_source = (source or "").strip() or f"upload:{filename}"
+    kb_result = kb.add_document(
+        doc_id=doc_id,
+        title=final_title,
+        source=final_source,
+        text=text,
+        categories=categories,
+        agent_ids=agent_ids,
+    )
+
+    # Bind to conversation if provided
+    if conversation_id:
+        conv = storage.get_conversation(conversation_id) or {}
+        existing = conv.get("kb_doc_ids") or []
+        merged = list(existing) + [doc_id]
+        storage.update_conversation_kb_doc_ids(conversation_id, merged)
+
+    # Optional: index embeddings (best-effort)
+    model = (embedding_model or settings.kb_embedding_model or "").strip()
+    should_index = _truthy_form(index_embeddings) if str(index_embeddings or "").strip() else bool(model)
+    embeddings = None
+    if should_index and model:
+        embeddings = await kb_retriever.index_embeddings(
+            embedding_model_spec=model,
+            doc_ids=[doc_id],
+            pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+        )
+
+    return {"ok": True, **kb_result, "doc_id": doc_id, "title": final_title, "source": final_source, "embeddings": embeddings}
+
+
 @app.get("/api/kb/documents/{doc_id}")
 async def kb_get_document(doc_id: str):
     doc = kb.get_document(doc_id)
@@ -445,6 +661,24 @@ async def kb_update_document(doc_id: str, request: KBUpdateRequest):
 async def kb_index(request: KBIndexRequest):
     settings = settings_store.get_settings()
     model = (request.embedding_model or settings.kb_embedding_model or "").strip()
+    if bool(request.async_job):
+        conversation_id = (request.conversation_id or "").strip()
+        if conversation_id and storage.get_conversation(conversation_id) is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if not plugin_manager.registry.get("kb_index"):
+            raise HTTPException(status_code=400, detail="Plugin disabled: kb_index")
+        job = job_runner.create_and_enqueue(
+            job_type="kb_index",
+            conversation_id=conversation_id,
+            payload={
+                "embedding_model": model,
+                "agent_id": request.agent_id or "",
+                "doc_ids": request.doc_ids,
+                "categories": request.categories,
+                "pool": int(request.pool or 5000),
+            },
+        )
+        return {"ok": True, "queued": True, "job": job.__dict__}
     return await kb_retriever.index_embeddings(
         embedding_model_spec=model,
         agent_id=(request.agent_id or "").strip() or None,
@@ -555,6 +789,24 @@ async def kg_create_graph(request: KGCreateRequest):
 
 @app.post("/api/kg/extract")
 async def kg_extract_and_upsert(request: KGExtractRequest):
+    if bool(request.async_job):
+        conversation_id = (request.conversation_id or "").strip()
+        if conversation_id and storage.get_conversation(conversation_id) is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if not plugin_manager.registry.get("kg_extract"):
+            raise HTTPException(status_code=400, detail="Plugin disabled: kg_extract")
+        job = job_runner.create_and_enqueue(
+            job_type="kg_extract",
+            conversation_id=conversation_id,
+            payload={
+                "graph_id": request.graph_id,
+                "text": request.text,
+                "model_spec": request.model_spec or "",
+                "ontology": request.ontology or DEFAULT_ONTOLOGY,
+            },
+        )
+        return {"ok": True, "queued": True, "job": job.__dict__}
+
     # Default to Chairman model for extraction.
     models = agents_store.get_models()
     model_spec = request.model_spec or models["chairman_model"]
@@ -663,13 +915,10 @@ async def kg_extract_and_upsert(request: KGExtractRequest):
 
 
 def _stable_uuid_fallback(graph_id: str, entity_type: str, name: str) -> str:
-    # Keep consistent with Neo4j store stable id.
-    import hashlib
+    # Backwards-compatible shim.
+    from .kg_utils import stable_uuid_fallback
 
-    normalized = (name or "").strip().lower()
-    base = f"{graph_id}:{entity_type}:{normalized}".encode("utf-8")
-    digest = hashlib.sha1(base).hexdigest()[:16]
-    return f"ent_{digest}"
+    return stable_uuid_fallback(graph_id, entity_type, name)
 
 
 @app.get("/api/kg/graphs/{graph_id}")
@@ -998,6 +1247,119 @@ async def set_conversation_report(conversation_id: str, request: ConversationRep
     return {"ok": True, "report_requirements": conv.get("report_requirements", "")}
 
 
+@app.post("/api/conversations/{conversation_id}/report/save_to_kb")
+async def save_conversation_report_to_kb(conversation_id: str):
+    """
+    Persist the latest Stage4 report into the KB and (optionally) bind it to the conversation.
+
+    This is a manual "rescue" endpoint in case auto-save was disabled or previously failed.
+    """
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Find latest report in conversation.
+    msgs = conversation.get("messages") or []
+    last_report = None
+    for m in reversed(msgs):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        s4 = m.get("stage4")
+        if isinstance(s4, dict) and (s4.get("report_markdown") or "").strip():
+            last_report = s4
+            break
+    if last_report is None:
+        raise HTTPException(status_code=400, detail="No Stage4 report found in this conversation")
+
+    existing_kb_doc_id = str(last_report.get("kb_doc_id") or "").strip()
+    if existing_kb_doc_id and kb.get_document(existing_kb_doc_id) is not None:
+        return {"ok": True, "kb_doc_id": existing_kb_doc_id, "already_saved": True}
+
+    settings = settings_store.get_settings()
+    title = f"讨论报告：{conversation.get('title') or conversation_id}"
+    category = (settings.report_kb_category or "council_reports").strip() or "council_reports"
+    report_md = str(last_report.get("report_markdown") or "").strip()
+
+    # Bind the report only to agents selected in this conversation.
+    # If the conversation uses default agents (agent_ids=None), fall back to all enabled agents.
+    enabled_ids = {a.id for a in agents_store.list_agents() if getattr(a, "enabled", False)}
+    selected = conversation.get("agent_ids")
+    if isinstance(selected, list) and selected:
+        agent_ids = [str(a).strip() for a in selected if str(a).strip() and str(a).strip() in enabled_ids]
+    else:
+        agent_ids = sorted(enabled_ids)
+    doc_id = uuid.uuid4().hex
+    kb.add_document(
+        doc_id=doc_id,
+        title=title,
+        source=f"conversation:{conversation_id}",
+        text=report_md,
+        categories=[category],
+        agent_ids=agent_ids,
+    )
+
+    # Best-effort embeddings.
+    model = (settings.kb_embedding_model or "").strip()
+    embeddings = None
+    if model:
+        try:
+            embeddings = await kb_retriever.index_embeddings(
+                embedding_model_spec=model,
+                doc_ids=[doc_id],
+                pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+            )
+        except Exception:
+            embeddings = None
+
+    # Bind to conversation KB scope (best-effort).
+    if bool(settings.auto_bind_report_to_conversation):
+        try:
+            existing = conversation.get("kb_doc_ids") or []
+            storage.update_conversation_kb_doc_ids(conversation_id, list(existing) + [doc_id])
+        except Exception:
+            pass
+
+    # Append a new Stage4 message that includes kb_doc_id so the UI can display it.
+    try:
+        storage.add_stage4_report_message(
+            conversation_id,
+            report={
+                "model": str(last_report.get("model") or ""),
+                "report_markdown": report_md,
+                "kb_doc_id": doc_id,
+            },
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "kb_doc_id": doc_id, "embeddings": embeddings}
+
+
+@app.put("/api/conversations/{conversation_id}/discussion")
+async def set_conversation_discussion(conversation_id: str, request: ConversationDiscussionRequest):
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    storage.update_conversation_discussion_config(
+        conversation_id,
+        discussion_mode=request.discussion_mode,
+        serious_iteration_rounds=request.serious_iteration_rounds,
+        lively_script=request.lively_script,
+        lively_max_messages=request.lively_max_messages,
+        lively_max_turns=request.lively_max_turns,
+    )
+    conv = storage.get_conversation(conversation_id) or {}
+    return {
+        "ok": True,
+        "discussion_mode": conv.get("discussion_mode", "serious"),
+        "serious_iteration_rounds": conv.get("serious_iteration_rounds", 1),
+        "lively_script": conv.get("lively_script", "groupchat"),
+        "lively_max_messages": conv.get("lively_max_messages", 24),
+        "lively_max_turns": conv.get("lively_max_turns", 6),
+    }
+
+
 @app.post("/api/conversations/{conversation_id}/invoke")
 async def invoke_agent(conversation_id: str, request: ConversationInvokeRequest):
     conversation = storage.get_conversation(conversation_id)
@@ -1076,6 +1438,54 @@ async def invoke_agent(conversation_id: str, request: ConversationInvokeRequest)
     raise HTTPException(status_code=400, detail="action 不支持（可用：ask|report）")
 
 
+@app.post("/api/jobs")
+async def create_job(request: JobCreateRequest):
+    job_type = (request.job_type or "").strip()
+    if not job_type:
+        raise HTTPException(status_code=400, detail="job_type 不能为空")
+    if not plugin_manager.registry.get(job_type):
+        raise HTTPException(status_code=400, detail=f"Unknown job_type: {job_type}")
+    conversation_id = (request.conversation_id or "").strip()
+    if conversation_id:
+        conv = storage.get_conversation(conversation_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    payload = request.payload or {}
+    job = job_runner.create_and_enqueue(job_type=job_type, payload=payload, conversation_id=conversation_id)
+    return {"ok": True, "job": job.__dict__}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = jobs_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": job.__dict__}
+
+
+@app.get("/api/jobs")
+async def list_jobs(conversation_id: str = "", status: str = "", limit: int = 50):
+    jobs = jobs_store.list_jobs(conversation_id=(conversation_id or "").strip(), status=(status or "").strip(), limit=limit)
+    return {"jobs": [j.__dict__ for j in jobs]}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    ok = jobs_store.cancel_job(job_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Cannot cancel job")
+    return {"ok": True}
+
+
+@app.get("/api/conversations/{conversation_id}/jobs")
+async def list_conversation_jobs(conversation_id: str, limit: int = 50):
+    conv = storage.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    jobs = jobs_store.list_jobs(conversation_id=conversation_id, limit=limit)
+    return {"jobs": [j.__dict__ for j in jobs]}
+
+
 @app.put("/api/conversations/{conversation_id}/agents")
 async def set_conversation_agents(conversation_id: str, agent_ids: List[str]):
     conversation = storage.get_conversation(conversation_id)
@@ -1138,10 +1548,127 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         title = await generate_conversation_title(request.content, conversation_id=conversation_id)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the full council process (includes optional extra stages)
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content, conversation_id=conversation_id
-    )
+    # Run the council process (mode-aware)
+    mode = str(conversation.get("discussion_mode") or "serious").strip().lower()
+    if mode not in ("serious", "lively"):
+        mode = "serious"
+
+    if mode == "lively":
+        preprocess = await stage0_preprocess(request.content, conversation_id)
+        lively_script = str(conversation.get("lively_script") or "groupchat").strip().lower()
+        lively_max_messages = int(conversation.get("lively_max_messages") or 24)
+        lively_max_turns = int(conversation.get("lively_max_turns") or 6)
+        lively_out = await stage2b_lively(
+            user_query=request.content,
+            conversation_id=conversation_id,
+            initial_script=lively_script,
+            max_messages=lively_max_messages,
+            max_turns=lively_max_turns,
+        )
+        roundtable = list(lively_out.get("transcript") or [])
+        # Reuse stage3/4 generators by synthesizing stage1 from transcript.
+        stage1_results = [
+            {"agent_name": m.get("agent_name") or "Agent", "model": m.get("model") or "", "response": m.get("message") or ""}
+            for m in roundtable
+        ]
+        stage2_results = []
+        fact_check = None
+        stage3_result = await stage3_synthesize_final(
+            request.content,
+            stage1_results,
+            stage2_results,
+            roundtable=roundtable,
+            fact_check=fact_check,
+            conversation_id=conversation_id,
+        )
+        report = await stage4_generate_report(
+            request.content,
+            stage0=preprocess,
+            stage1_results=stage1_results,
+            stage2_results=stage2_results,
+            roundtable=roundtable,
+            fact_check=fact_check,
+            stage3_result=stage3_result,
+            conversation_id=conversation_id,
+        )
+
+        # Persist script updates (best-effort)
+        final_script = str(lively_out.get("script") or lively_script).strip().lower()
+        if final_script and final_script != lively_script:
+            storage.update_conversation_discussion_config(conversation_id, lively_script=final_script)
+        for item in list(lively_out.get("script_history") or []):
+            if isinstance(item, dict):
+                storage.update_conversation_discussion_config(
+                    conversation_id,
+                    lively_script_history_append=item,
+                )
+
+        metadata = {
+            "preprocess": preprocess,
+            "roundtable": roundtable,
+            "fact_check": fact_check,
+            "report": report,
+            "discussion_mode": "lively",
+            "lively": lively_out,
+        }
+    else:
+        preprocess = await stage0_preprocess(request.content, conversation_id)
+        rounds = max(1, min(8, int(conversation.get("serious_iteration_rounds") or 1)))
+        stage1_results = []
+        stage2_results = []
+        stage3_result = {}
+        roundtable = []
+        fact_check = None
+        report = None
+        iterations_meta = []
+        draft = ""
+        label_to_agent = {}
+        aggregate_rankings = {}
+
+        for i in range(1, rounds + 1):
+            q = request.content if i == 1 else (request.content + "\n\n【上轮报告草稿（用于继续迭代）】\n" + (draft or "") + "\n\n请继续完善并修订。")
+            stage1_results = await stage1_collect_responses(q, conversation_id=conversation_id, preprocess=preprocess)
+            stage2_results, label_to_agent = await stage2_collect_rankings(q, stage1_results, conversation_id=conversation_id)
+            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_agent)
+            roundtable = await stage2b_roundtable(q, stage1_results, stage2_results, conversation_id=conversation_id)
+            fact_check = await stage2c_fact_check(q, stage1_results, stage2_results, roundtable, conversation_id=conversation_id)
+            stage3_result = await stage3_synthesize_final(
+                q,
+                stage1_results,
+                stage2_results,
+                roundtable=roundtable,
+                fact_check=fact_check,
+                conversation_id=conversation_id,
+            )
+            report = await stage4_generate_report(
+                q,
+                stage0=preprocess,
+                stage1_results=stage1_results,
+                stage2_results=stage2_results,
+                roundtable=roundtable,
+                fact_check=fact_check,
+                stage3_result=stage3_result,
+                conversation_id=conversation_id,
+            )
+            draft = str((report or {}).get("report_markdown") or "")
+            iterations_meta.append(
+                {
+                    "iteration": i,
+                    "aggregate_rankings": aggregate_rankings,
+                    "report_kb_doc_id": (report or {}).get("kb_doc_id") if isinstance(report, dict) else "",
+                }
+            )
+
+        metadata = {
+            "label_to_agent": label_to_agent,
+            "aggregate_rankings": aggregate_rankings,
+            "preprocess": preprocess,
+            "roundtable": roundtable,
+            "fact_check": fact_check,
+            "report": report,
+            "discussion_mode": "serious",
+            "serious_iterations": iterations_meta,
+        }
 
     # Add assistant message with all stages (including optional extra stages)
     storage.add_assistant_message(
@@ -1198,52 +1725,166 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             preprocess = await stage0_preprocess(request.content, conversation_id)
             yield f"data: {json.dumps({'type': 'stage0_complete', 'data': preprocess})}\n\n"
 
-            # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content, conversation_id=conversation_id, preprocess=preprocess)
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
+            # Mode-aware discussion
+            conv_now = storage.get_conversation(conversation_id) or {}
+            mode = str(conv_now.get("discussion_mode") or "serious").strip().lower()
+            if mode not in ("serious", "lively"):
+                mode = "serious"
 
-            # Stage 2: Collect rankings
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_agent = await stage2_collect_rankings(request.content, stage1_results, conversation_id=conversation_id)
-            aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_agent)
-            yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_agent': label_to_agent, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+            label_to_agent = {}
+            aggregate_rankings = {}
+            roundtable = []
+            fact_check = None
+            report = None
+            stage3_result = {}
+            stage2_results = []
+            stage1_results = []
+            metadata = {}
 
-            # Stage 2B: Roundtable (optional)
-            yield f"data: {json.dumps({'type': 'stage2b_start'})}\n\n"
-            roundtable = await stage2b_roundtable(request.content, stage1_results, stage2_results, conversation_id=conversation_id)
-            yield f"data: {json.dumps({'type': 'stage2b_complete', 'data': roundtable})}\n\n"
+            if mode == "lively":
+                lively_script = str(conv_now.get("lively_script") or "groupchat").strip().lower()
+                lively_max_messages = int(conv_now.get("lively_max_messages") or 24)
+                lively_max_turns = int(conv_now.get("lively_max_turns") or 6)
 
-            # Stage 2C: Fact-check (optional)
-            yield f"data: {json.dumps({'type': 'stage2c_start'})}\n\n"
-            fact_check = await stage2c_fact_check(request.content, stage1_results, stage2_results, roundtable, conversation_id=conversation_id)
-            yield f"data: {json.dumps({'type': 'stage2c_complete', 'data': fact_check})}\n\n"
+                # Stage 1: empty (not used in lively)
+                yield f"data: {json.dumps({'type': 'stage1_start', 'mode': 'lively'})}\n\n"
+                stage1_results = []
+                yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results, 'mode': 'lively'})}\n\n"
 
-            # Stage 3: Synthesize final answer
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(
-                request.content,
-                stage1_results,
-                stage2_results,
-                roundtable=roundtable,
-                fact_check=fact_check,
-                conversation_id=conversation_id,
-            )
-            yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+                # Stage 2: empty (not used in lively)
+                yield f"data: {json.dumps({'type': 'stage2_start', 'mode': 'lively'})}\n\n"
+                stage2_results = []
+                label_to_agent = {}
+                aggregate_rankings = {}
+                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_agent': label_to_agent, 'aggregate_rankings': aggregate_rankings}, 'mode': 'lively'})}\n\n"
 
-            # Stage 4: Chairman report (optional)
-            yield f"data: {json.dumps({'type': 'stage4_start'})}\n\n"
-            report = await stage4_generate_report(
-                request.content,
-                stage0=preprocess,
-                stage1_results=stage1_results,
-                stage2_results=stage2_results,
-                roundtable=roundtable,
-                fact_check=fact_check,
-                stage3_result=stage3_result,
-                conversation_id=conversation_id,
-            )
-            yield f"data: {json.dumps({'type': 'stage4_complete', 'data': report})}\n\n"
+                # Stage 2B: lively transcript
+                yield f"data: {json.dumps({'type': 'stage2b_start', 'mode': 'lively'})}\n\n"
+                lively_out = await stage2b_lively(
+                    user_query=request.content,
+                    conversation_id=conversation_id,
+                    initial_script=lively_script,
+                    max_messages=lively_max_messages,
+                    max_turns=lively_max_turns,
+                )
+                roundtable = list(lively_out.get("transcript") or [])
+                yield f"data: {json.dumps({'type': 'stage2b_complete', 'data': roundtable, 'mode': 'lively', 'metadata': {'lively': lively_out}})}\n\n"
+
+                # Persist script updates (best-effort)
+                final_script = str(lively_out.get("script") or lively_script).strip().lower()
+                if final_script and final_script != lively_script:
+                    storage.update_conversation_discussion_config(conversation_id, lively_script=final_script)
+                for item in list(lively_out.get("script_history") or []):
+                    if isinstance(item, dict):
+                        storage.update_conversation_discussion_config(conversation_id, lively_script_history_append=item)
+
+                # Stage 2C: skipped in lively (optional future)
+                yield f"data: {json.dumps({'type': 'stage2c_start', 'mode': 'lively'})}\n\n"
+                fact_check = None
+                yield f"data: {json.dumps({'type': 'stage2c_complete', 'data': fact_check, 'mode': 'lively'})}\n\n"
+
+                # Synthesize stage1 from transcript for chairman summary/report
+                stage1_results = [
+                    {"agent_name": m.get("agent_name") or "Agent", "model": m.get("model") or "", "response": m.get("message") or ""}
+                    for m in roundtable
+                ]
+
+                yield f"data: {json.dumps({'type': 'stage3_start', 'mode': 'lively'})}\n\n"
+                stage3_result = await stage3_synthesize_final(
+                    request.content,
+                    stage1_results,
+                    stage2_results,
+                    roundtable=roundtable,
+                    fact_check=fact_check,
+                    conversation_id=conversation_id,
+                )
+                yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result, 'mode': 'lively'})}\n\n"
+
+                yield f"data: {json.dumps({'type': 'stage4_start', 'mode': 'lively'})}\n\n"
+                report = await stage4_generate_report(
+                    request.content,
+                    stage0=preprocess,
+                    stage1_results=stage1_results,
+                    stage2_results=stage2_results,
+                    roundtable=roundtable,
+                    fact_check=fact_check,
+                    stage3_result=stage3_result,
+                    conversation_id=conversation_id,
+                )
+                yield f"data: {json.dumps({'type': 'stage4_complete', 'data': report, 'mode': 'lively'})}\n\n"
+
+                metadata = {
+                    "label_to_agent": label_to_agent,
+                    "aggregate_rankings": aggregate_rankings,
+                    "preprocess": preprocess,
+                    "roundtable": roundtable,
+                    "fact_check": fact_check,
+                    "report": report,
+                    "discussion_mode": "lively",
+                    "lively": lively_out,
+                }
+            else:
+                rounds = max(1, min(8, int(conv_now.get("serious_iteration_rounds") or 1)))
+                iterations_meta = []
+                draft = ""
+
+                for it in range(1, rounds + 1):
+                    q = request.content if it == 1 else (request.content + "\n\n【上轮报告草稿（用于继续迭代）】\n" + (draft or "") + "\n\n请继续完善并修订。")
+
+                    yield f"data: {json.dumps({'type': 'stage1_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+                    stage1_results = await stage1_collect_responses(q, conversation_id=conversation_id, preprocess=preprocess)
+                    yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'stage2_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+                    stage2_results, label_to_agent = await stage2_collect_rankings(q, stage1_results, conversation_id=conversation_id)
+                    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_agent)
+                    yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_agent': label_to_agent, 'aggregate_rankings': aggregate_rankings}, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'stage2b_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+                    roundtable = await stage2b_roundtable(q, stage1_results, stage2_results, conversation_id=conversation_id)
+                    yield f"data: {json.dumps({'type': 'stage2b_complete', 'data': roundtable, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'stage2c_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+                    fact_check = await stage2c_fact_check(q, stage1_results, stage2_results, roundtable, conversation_id=conversation_id)
+                    yield f"data: {json.dumps({'type': 'stage2c_complete', 'data': fact_check, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'stage3_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+                    stage3_result = await stage3_synthesize_final(
+                        q,
+                        stage1_results,
+                        stage2_results,
+                        roundtable=roundtable,
+                        fact_check=fact_check,
+                        conversation_id=conversation_id,
+                    )
+                    yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'stage4_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+                    report = await stage4_generate_report(
+                        q,
+                        stage0=preprocess,
+                        stage1_results=stage1_results,
+                        stage2_results=stage2_results,
+                        roundtable=roundtable,
+                        fact_check=fact_check,
+                        stage3_result=stage3_result,
+                        conversation_id=conversation_id,
+                    )
+                    yield f"data: {json.dumps({'type': 'stage4_complete', 'data': report, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
+
+                    draft = str((report or {}).get("report_markdown") or "")
+                    iterations_meta.append({"iteration": it, "report_kb_doc_id": (report or {}).get("kb_doc_id") if isinstance(report, dict) else ""})
+
+                metadata = {
+                    "label_to_agent": label_to_agent,
+                    "aggregate_rankings": aggregate_rankings,
+                    "preprocess": preprocess,
+                    "roundtable": roundtable,
+                    "fact_check": fact_check,
+                    "report": report,
+                    "discussion_mode": "serious",
+                    "serious_iterations": iterations_meta,
+                }
 
             # Wait for title generation if it was started
             if title_task:
@@ -1252,14 +1893,6 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
 
             # Save complete assistant message
-            metadata = {
-                "label_to_agent": label_to_agent,
-                "aggregate_rankings": aggregate_rankings,
-                "preprocess": preprocess,
-                "roundtable": roundtable,
-                "fact_check": fact_check,
-                "report": report,
-            }
             storage.add_assistant_message(
                 conversation_id,
                 stage1_results,

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import Markdown from './Markdown';
 import './Stage1.css';
 
 function shortLabel(modelSpec, agentName) {
@@ -42,7 +42,7 @@ export default function Stage1({ responses }) {
           {responses[activeTab].model}
         </div>
         <div className="response-text markdown-content">
-          <ReactMarkdown>{responses[activeTab].response}</ReactMarkdown>
+          <Markdown>{responses[activeTab].response}</Markdown>
         </div>
       </div>
     </div>

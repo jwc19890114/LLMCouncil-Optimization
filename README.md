@@ -1,6 +1,13 @@
-# LLM Council
+# SynthesisLab
 
 ![llmcouncil](header.jpg)
+
+## 最近更新
+
+- 活力模式（Stage 2B）改为“热身碰撞（每人 1 条）→ Chairman 选择可变数量意见领袖 → 领袖先发言并点名提问 → 其他人必须接话并给出新内容 → 自由流 + 收敛 checkpoint”的互动机制
+- 意见领袖数量不固定（当前上限 3），支持主线（mainline）与分工（assignments），并明确禁止纯附和式回复
+- 前端 Stage 2B 以“群聊气泡”方式展示（头像、系统提示），并展示活力模式元信息（script/turns/messages）
+- 后端 `stage2b_complete` SSE 事件会携带 `metadata.lively`，用于前端回填展示
 
 > 本仓库基于原始项目 `karpathy/llm-council`，并针对“数据分析/知识库/图谱/可长期迭代”的目标做了增强与优化。
 
@@ -189,6 +196,21 @@ npm run dev
   - `DELETE /api/kb/documents/{doc_id}`
   - `GET /api/kb/search?q=...&agent_id=...`
   - `POST /api/kb/index`（预先为知识库分块生成 embeddings，加速语义检索）
+
+#### 持续导入（监听目录，新增）
+
+- 目标：文件放进指定目录后自动落盘到知识库（可选自动建 embedding），做到“无感入库、可长期积累”。
+- 默认监听目录：`data/kb_watch`（可在设置里修改）。
+- 设置入口：前端 `流程设置` → `知识库：持续导入`
+- 相关接口：
+  - `GET /api/kb/watch/status`
+  - `POST /api/kb/watch/scan`（立即扫描一次）
+- 环境变量（写入 `.env`）：
+  - `KB_WATCH_ENABLE=true|false`
+  - `KB_WATCH_ROOTS=path1;path2`（分号/逗号分隔）
+  - `KB_WATCH_EXTS=txt,md,json,log`
+  - `KB_WATCH_INTERVAL_SECONDS=10`
+  - `KB_WATCH_MAX_FILE_MB=20`
 
 #### 知识库分类
 

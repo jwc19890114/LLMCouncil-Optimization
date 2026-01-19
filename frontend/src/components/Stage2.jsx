@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import Markdown from './Markdown';
 import './Stage2.css';
 
 function shortLabel(modelSpec, agentName) {
@@ -60,9 +60,7 @@ export default function Stage2({ rankings, labelToAgent, aggregateRankings }) {
           {rankings[activeTab].model}
         </div>
         <div className="ranking-content markdown-content">
-          <ReactMarkdown>
-            {deAnonymizeText(rankings[activeTab].ranking, labelToAgent)}
-          </ReactMarkdown>
+          <Markdown>{deAnonymizeText(rankings[activeTab].ranking, labelToAgent)}</Markdown>
         </div>
 
         {rankings[activeTab].parsed_ranking &&

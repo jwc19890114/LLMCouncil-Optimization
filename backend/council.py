@@ -17,6 +17,7 @@ from .storage import get_conversation
 from .trace_store import append as trace_append
 from .web_search import ddg_search
 from .neo4j_store import Neo4jKGStore
+from .jobs_store import JobsStore
 
 
 def _extract_json_object(text: str) -> Dict[str, Any] | None:
@@ -294,11 +295,24 @@ async def _build_realtime_context(user_query: str, conversation_id: str | None) 
             if conversation_id:
                 trace_append(conversation_id, {"type": "web_search_error", "error": str(e)})
 
+    # Job results refill (VCP-like): inject completed long-task summaries once.
+    if conversation_id:
+        try:
+            items = _jobs.fetch_injectable_summaries(conversation_id=conversation_id, limit=4)
+        except Exception:
+            items = []
+        if items:
+            lines = ["后台任务结果（已完成，可在本轮讨论中使用）："]
+            for it in items:
+                lines.append(f"- {it.get('summary')}")
+            chunks.append("\n".join(lines))
+
     return "\n\n".join(chunks).strip()
 
 
 _kb = KBStore()
 _kb_retriever = KBHybridRetriever(_kb)
+_jobs = JobsStore()
 
 
 async def stage0_preprocess(user_query: str, conversation_id: str | None) -> Dict[str, Any] | None:
@@ -804,6 +818,584 @@ async def stage2b_roundtable(
     return out
 
 
+def _lively_script_rules(script: str) -> str:
+    script = (script or "groupchat").strip().lower()
+    if script == "brainstorm":
+        return (
+            "剧本：头脑风暴（活力模式）\n"
+            "- 目标：尽可能多地产出高质量点子/角度/问题，而不是立刻收敛\n"
+            "- 规则：短句为主；允许发散；不要过早否定；每次输出最多 5 条要点\n"
+            "- 允许：提出反直觉观点、类比、实验方案、可验证假设\n"
+        )
+    if script == "interview":
+        return (
+            "剧本：角色扮演采访（活力模式）\n"
+            "- 你正在接受 Chairman 的采访，请像真实专家一样回答\n"
+            "- 规则：回答要简洁、条理清晰；尽量给出例子/反例；最后给出 1 个你希望继续追问的问题\n"
+        )
+    return (
+        "剧本：普通群聊（活力模式）\n"
+        "- 目标：像群聊一样自然互动，互相接话、补充、反驳、追问\n"
+        "- 规则：优先引用/回应上一位的关键点；避免长篇大论；保持节奏\n"
+    )
+
+
+def _format_lively_transcript_snippet(transcript: List[Dict[str, Any]], *, last_n: int = 10) -> str:
+    items = transcript[-max(0, int(last_n or 0)) :]
+    lines: List[str] = []
+    for m in items:
+        name = str(m.get("agent_name") or "Agent")
+        msg = str(m.get("message") or "").strip()
+        if not msg:
+            continue
+        if len(msg) > 900:
+            msg = msg[:900] + "\n\n（已截断）"
+        lines.append(f"[{name}] {msg}")
+    return "\n\n".join(lines)
+
+
+def _lively_message_brief(name: str, message: str, *, max_chars: int = 220) -> str:
+    n = str(name or "Agent").strip() or "Agent"
+    t = str(message or "").strip()
+    if len(t) > max_chars:
+        t = t[:max_chars] + "…"
+    return f"[{n}] {t}"
+
+
+def _pick_default_leaders(agents: List[AgentConfig], *, k: int) -> List[str]:
+    k = max(1, min(int(k), len(agents)))
+    return [a.id for a in agents[:k]]
+
+
+def _extract_leader_ids(data: Dict[str, Any], agents: List[AgentConfig], *, max_leaders: int) -> List[str]:
+    by_id = {a.id: a for a in agents}
+    by_name = {a.name.strip().lower(): a for a in agents if (a.name or "").strip()}
+
+    raw = data.get("leaders")
+    items: List[Any] = []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = [raw]
+
+    chosen: List[str] = []
+    for it in items:
+        if isinstance(it, str):
+            s = it.strip()
+            if s in by_id:
+                chosen.append(s)
+                continue
+            a = by_name.get(s.lower())
+            if a:
+                chosen.append(a.id)
+            continue
+        if isinstance(it, dict):
+            aid = str(it.get("agent_id") or "").strip()
+            if aid and aid in by_id:
+                chosen.append(aid)
+                continue
+            nm = str(it.get("agent_name") or "").strip().lower()
+            a = by_name.get(nm)
+            if a:
+                chosen.append(a.id)
+
+    out: List[str] = []
+    seen = set()
+    for x in chosen:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+        if len(out) >= max_leaders:
+            break
+    return out
+
+
+async def _chairman_pick_lively_leaders(
+    *,
+    conversation_id: str,
+    user_query: str,
+    agents: List[AgentConfig],
+    transcript: List[Dict[str, Any]],
+    script: str,
+) -> Dict[str, Any]:
+    max_leaders = min(3, len(agents))
+    chairman_agent = _get_chairman_agent(conversation_id)
+    chairman_spec = _get_chairman_spec(conversation_id)
+
+    warmup_lines = "\n".join(
+        [
+            _lively_message_brief(m.get("agent_name"), m.get("message"))
+            for m in transcript[-len(agents) :]
+            if isinstance(m, dict)
+        ]
+    )
+    if not warmup_lines.strip():
+        warmup_lines = _format_lively_transcript_snippet(transcript, last_n=min(12, len(transcript)))
+
+    system = (
+        f"你是活力模式讨论的 Chairman（弱控场）。\n"
+        f"任务：从热身碰撞中识别“意见领袖”(1~{max_leaders}人)，并为下一阶段设定主线与分工。\n"
+        "要求：\n"
+        "- 输出必须是严格 JSON（不要 Markdown，不要解释文字）。\n"
+        f"- leaders 必须是数组，长度 1~{max_leaders}。\n"
+        '- leaders 元素可以是对象：{"agent_id":"...","reason":"..."}。\n'
+        '- assignments 是数组：{"agent_id":"...","task":"证据/反例/替代方案/风险边界/步骤清单"}。\n'
+        "- next_script 可选：brainstorm/interview/groupchat（留空表示不切换）。\n"
+        "- action: continue|converge。\n"
+        '- 可选 mainline: "一句话主线"\n'
+    )
+
+    roster = [{"agent_id": a.id, "agent_name": a.name, "model": a.model_spec} for a in agents]
+    user = (
+        "用户主题：\n"
+        + (user_query or "").strip()
+        + "\n\n当前剧本："
+        + script
+        + "\n\n参与者：\n"
+        + json.dumps(roster, ensure_ascii=False)
+        + "\n\n热身碰撞（每人一条）：\n"
+        + warmup_lines
+        + "\n\n请输出 JSON："
+    )
+
+    decision = await _query_agent(
+        conversation_id=conversation_id,
+        stage="lively_leader_pick",
+        agent=chairman_agent if chairman_agent else AgentConfig(id="chairman", name="Chairman", model_spec=chairman_spec),
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        timeout=60.0,
+    )
+
+    raw = str((decision or {}).get("content") or "")
+    data = _extract_json_object(raw) or {}
+    leader_ids = _extract_leader_ids(data, agents, max_leaders=max_leaders)
+    if not leader_ids:
+        leader_ids = _pick_default_leaders(agents, k=min(2, len(agents)))
+
+    assignments = data.get("assignments")
+    if not isinstance(assignments, list):
+        assignments = []
+
+    next_script = str(data.get("next_script") or "").strip().lower()
+    if next_script not in ("brainstorm", "interview", "groupchat"):
+        next_script = ""
+
+    action = str(data.get("action") or "continue").strip().lower()
+    if action not in ("continue", "converge"):
+        action = "continue"
+
+    return {
+        "leaders": leader_ids,
+        "leader_reasoning": data.get("leaders") or [],
+        "mainline": str(data.get("mainline") or "").strip(),
+        "assignments": assignments,
+        "next_script": next_script,
+        "action": action,
+    }
+
+
+def _get_chairman_agent(conversation_id: str | None) -> AgentConfig | None:
+    if not conversation_id:
+        return None
+    caid = _get_conversation_chairman_agent_id(conversation_id)
+    if not caid:
+        return None
+    agents = _get_conversation_agents(conversation_id)
+    return next((a for a in agents if a.id == caid), None)
+
+
+def _get_chairman_spec(conversation_id: str | None) -> str:
+    models = get_agent_models()
+    if not conversation_id:
+        return models.get("chairman_model") or ""
+    chairman_agent = _get_chairman_agent(conversation_id)
+    if chairman_agent:
+        return chairman_agent.model_spec
+    return (_get_conversation_chairman_model(conversation_id) or models.get("chairman_model") or "").strip()
+
+
+async def stage2b_lively(
+    *,
+    user_query: str,
+    conversation_id: str,
+    initial_script: str,
+    max_messages: int,
+    max_turns: int,
+) -> Dict[str, Any]:
+    """
+    Free-flow multi-agent chat transcript with chairman checkpoints.
+    Returns: {transcript, script, script_history, turns_used, messages_used}
+    """
+    settings = get_settings()
+    agents = _get_conversation_agents(conversation_id)
+    if not agents:
+        return {"transcript": [], "script": initial_script, "script_history": [], "turns_used": 0, "messages_used": 0}
+
+    script = (initial_script or "groupchat").strip().lower()
+    if script not in ("brainstorm", "interview", "groupchat"):
+        script = "groupchat"
+    max_messages = max(6, min(200, int(max_messages or 24)))
+    max_turns = max(1, min(50, int(max_turns or 6)))
+
+    chairman_agent = _get_chairman_agent(conversation_id)
+    chairman_spec = _get_chairman_spec(conversation_id)
+
+    transcript: List[Dict[str, Any]] = []
+    script_history: List[Dict[str, Any]] = []
+
+    checkpoint_every = 6
+    turns_used = 0
+
+    base_goal = (
+        "你正在参与一个多人讨论小组。请以真实专家口吻发言。\n"
+        "注意：最终会生成一份报告，因此请尽量给出可复用的信息（观点、证据、可执行建议、需要核查的点）。\n"
+    )
+    if settings.output_language == "zh":
+        base_goal += "输出要求：使用简体中文。\n"
+    elif settings.output_language == "en":
+        base_goal += "Output requirement: English.\n"
+
+    if conversation_id:
+        trace_append(
+            conversation_id,
+            {
+                "type": "stage_start",
+                "stage": "stage2b_lively",
+                "script": script,
+                "max_messages": max_messages,
+                "max_turns": max_turns,
+            },
+        )
+
+    uq = (user_query or "").strip()
+    if not uq:
+        return {
+            "transcript": [],
+            "script": script,
+            "script_history": [],
+            "turns_used": 0,
+            "messages_used": 0,
+            "leaders": [],
+            "mainline": "",
+            "assignments": [],
+        }
+
+    context_text = await _build_realtime_context(uq, conversation_id)
+    knowledge_cache: Dict[str, str] = {}
+
+    async def _get_knowledge(a: AgentConfig) -> str:
+        if a.id in knowledge_cache:
+            return knowledge_cache[a.id]
+        k = await _build_agent_knowledge(a, uq, conversation_id)
+        knowledge_cache[a.id] = k or ""
+        return knowledge_cache[a.id]
+
+    by_id: Dict[str, AgentConfig] = {a.id: a for a in agents}
+
+    # Phase A: warmup collision (each agent 1 message)
+    for agent in agents:
+        if len(transcript) >= max_messages:
+            break
+
+        knowledge = await _get_knowledge(agent)
+        messages = _agent_system_messages(agent)
+        messages.append({"role": "system", "content": base_goal + "\n" + _lively_script_rules(script)})
+        messages.append(
+            {
+                "role": "system",
+                "content": "热身碰撞：你只发 1 条消息（<=120字）。给出你最有价值的观点/问题/建议，避免复读。",
+            }
+        )
+        if context_text:
+            messages.append({"role": "system", "content": f"可用外部信息：\n{context_text}"})
+        if knowledge:
+            messages.append({"role": "system", "content": knowledge})
+        messages.append({"role": "user", "content": uq})
+
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="lively_warmup",
+            agent=agent,
+            messages=messages,
+            timeout=80.0,
+        )
+        content = str((resp or {}).get("content") or "").strip()
+        if not content:
+            continue
+        transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+
+    # Phase B: chairman picks variable #leaders + mainline/assignments
+    leader_pick = await _chairman_pick_lively_leaders(
+        conversation_id=conversation_id,
+        user_query=uq,
+        agents=agents,
+        transcript=transcript,
+        script=script,
+    )
+    leader_ids: List[str] = [lid for lid in list(leader_pick.get("leaders") or []) if lid in by_id]
+    if not leader_ids:
+        leader_ids = _pick_default_leaders(agents, k=1)
+
+    mainline = str(leader_pick.get("mainline") or "").strip()
+    assignments = list(leader_pick.get("assignments") or [])
+
+    next_script = str(leader_pick.get("next_script") or "").strip().lower()
+    if next_script in ("brainstorm", "interview", "groupchat") and next_script != script:
+        script_history.append({"from": script, "to": next_script, "reason": "chairman pick"})
+        script = next_script
+
+    if len(transcript) < max_messages:
+        leader_names = [by_id[lid].name for lid in leader_ids if lid in by_id]
+        msg_lines = [f"意见领袖：{', '.join(leader_names) if leader_names else '（未指定）'}"]
+        if mainline:
+            msg_lines.append(f"主线：{mainline}")
+        if assignments:
+            msg_lines.append("分工：" + json.dumps(assignments, ensure_ascii=False))
+        transcript.append(
+            {
+                "agent_id": "",
+                "agent_name": chairman_agent.name if chairman_agent else "Chairman",
+                "model": chairman_spec,
+                "message": "\n".join(msg_lines),
+            }
+        )
+
+    # Phase C: leaders speak first
+    for lid in leader_ids:
+        if len(transcript) >= max_messages:
+            break
+        agent = by_id.get(lid)
+        if not agent:
+            continue
+
+        knowledge = await _get_knowledge(agent)
+        recent = _format_lively_transcript_snippet(transcript, last_n=12)
+        messages = _agent_system_messages(agent)
+        messages.append({"role": "system", "content": base_goal + "\n" + _lively_script_rules(script)})
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "你是本轮意见领袖之一。请先抛出讨论框架/结论雏形，并点名提问 2~3 位其他专家，让他们基于你的框架补充/反驳。"
+                    + (f"\n本轮主线：{mainline}" if mainline else "")
+                    + "\n要求：<=220字，必须可引发互动。"
+                ),
+            }
+        )
+        if context_text:
+            messages.append({"role": "system", "content": f"可用外部信息：\n{context_text}"})
+        if knowledge:
+            messages.append({"role": "system", "content": knowledge})
+        if recent:
+            messages.append({"role": "system", "content": "最近的群聊记录（节选）：\n" + recent})
+        messages.append({"role": "user", "content": f"主题：{uq}\n请开场。"})
+
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="lively_leader_open",
+            agent=agent,
+            messages=messages,
+            timeout=90.0,
+        )
+        content = str((resp or {}).get("content") or "").strip()
+        if not content:
+            continue
+        transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+
+    # Phase D: everyone else responds (must add their own substance)
+    def _assignment_for(aid: str) -> str:
+        for it in assignments:
+            if isinstance(it, dict) and str(it.get("agent_id") or "").strip() == aid:
+                return str(it.get("task") or "").strip()
+        return ""
+
+    for agent in agents:
+        if len(transcript) >= max_messages:
+            break
+        if agent.id in leader_ids:
+            continue
+
+        task = _assignment_for(agent.id)
+        knowledge = await _get_knowledge(agent)
+        recent = _format_lively_transcript_snippet(transcript, last_n=12)
+        messages = _agent_system_messages(agent)
+        messages.append({"role": "system", "content": base_goal + "\n" + _lively_script_rules(script)})
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "你现在需要“接话”意见领袖的开场，并贡献你自己的东西：必须至少包含其一：证据/反例/替代方案/风险边界/步骤清单。"
+                    "禁止只有“同意/支持/赞同”之类的附和。"
+                    + (f"\n你的分工任务：{task}" if task else "")
+                    + (f"\n本轮主线：{mainline}" if mainline else "")
+                    + "\n要求：<=220字。"
+                ),
+            }
+        )
+        if context_text:
+            messages.append({"role": "system", "content": f"可用外部信息：\n{context_text}"})
+        if knowledge:
+            messages.append({"role": "system", "content": knowledge})
+        if recent:
+            messages.append({"role": "system", "content": "最近的群聊记录（节选）：\n" + recent})
+        messages.append({"role": "user", "content": f"主题：{uq}\n请接话并发言。"})
+
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="lively_follow",
+            agent=agent,
+            messages=messages,
+            timeout=90.0,
+        )
+        content = str((resp or {}).get("content") or "").strip()
+        if not content:
+            continue
+        transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+
+    # Free-flow rounds with chairman checkpoints
+    checkpoint_every = max(4, min(10, len(agents) + 1))
+    since_checkpoint = 0
+
+    def _pick_next_agent(last_id: str) -> AgentConfig:
+        # rotate, avoid same speaker twice
+        for _ in range(len(agents) + 1):
+            a = agents.pop(0)
+            agents.append(a)
+            if a.id != last_id:
+                return a
+        return agents[0]
+
+    while len(transcript) < max_messages:
+        last_id = str((transcript[-1] or {}).get("agent_id") or "").strip() if transcript else ""
+        agent = _pick_next_agent(last_id)
+
+        task = _assignment_for(agent.id)
+        knowledge = await _get_knowledge(agent)
+        recent = _format_lively_transcript_snippet(transcript, last_n=12)
+
+        system_hints = [
+            base_goal,
+            _lively_script_rules(script),
+            (f"本轮主线：{mainline}" if mainline else ""),
+            (f"你的分工任务：{task}" if task else ""),
+            "继续像群聊一样接话上一位，补充新信息/新角度/新问题；避免复读与长篇大论（<=220字）。",
+        ]
+        if agent.id not in leader_ids:
+            system_hints.append("如果你要表示赞同，必须同时补充证据/反例/替代方案/风险边界/步骤清单之一。")
+        messages = _agent_system_messages(agent)
+        messages.append({"role": "system", "content": "\n".join([x for x in system_hints if x])})
+        if context_text:
+            messages.append({"role": "system", "content": f"可用外部信息：\n{context_text}"})
+        if knowledge:
+            messages.append({"role": "system", "content": knowledge})
+        if recent:
+            messages.append({"role": "system", "content": "最近的群聊记录（节选）：\n" + recent})
+        messages.append({"role": "user", "content": f"主题：{uq}\n请继续发言。"})
+
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="lively_chat",
+            agent=agent,
+            messages=messages,
+            timeout=90.0,
+        )
+        content = str((resp or {}).get("content") or "").strip()
+        if content:
+            transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+            since_checkpoint += 1
+
+        if since_checkpoint >= checkpoint_every:
+            since_checkpoint = 0
+            turns_used += 1
+            if turns_used >= max_turns:
+                break
+
+            snippet = _format_lively_transcript_snippet(transcript, last_n=12)
+            req = _get_conversation_report_requirements(conversation_id)
+            system = (
+                "你是活力模式讨论的弱控场 Chairman。\n"
+                "任务：决定是否继续自由讨论，或进入收敛阶段生成最终报告。\n"
+                "你也可以决定切换剧本（brainstorm/interview/groupchat）。\n"
+                "输出必须是严格 JSON（不要 Markdown，不要解释）：\n"
+                '{"action":"continue|converge","next_script":"brainstorm|interview|groupchat|","chairman_note":"...","reason":"..."}\n'
+                "约束：chairman_note <= 120 字。\n"
+            )
+            roster = [{"agent_id": a.id, "agent_name": a.name} for a in _get_conversation_agents(conversation_id)]
+            user = (
+                "用户主题：\n"
+                + uq
+                + (f"\n\n本轮主线：{mainline}" if mainline else "")
+                + ("\n\n报告要求（若有）：\n" + req if req else "")
+                + "\n\n意见领袖：\n"
+                + json.dumps(leader_ids, ensure_ascii=False)
+                + "\n\n参与者：\n"
+                + json.dumps(roster, ensure_ascii=False)
+                + "\n\n当前群聊节选：\n"
+                + snippet
+                + "\n\n请给出你的 JSON 决策。"
+            )
+            decision = await _query_agent(
+                conversation_id=conversation_id,
+                stage="lively_chairman_decide",
+                agent=chairman_agent if chairman_agent else AgentConfig(id="chairman", name="Chairman", model_spec=chairman_spec),
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                timeout=60.0,
+            )
+            raw = str((decision or {}).get("content") or "")
+            data = _extract_json_object(raw) or {}
+            action = str(data.get("action") or "continue").strip().lower()
+            next_script = str(data.get("next_script") or "").strip().lower()
+            note = str(data.get("chairman_note") or "").strip()
+            reason = str(data.get("reason") or "").strip()
+
+            if next_script in ("brainstorm", "interview", "groupchat") and next_script != script:
+                script_history.append({"from": script, "to": next_script, "reason": reason})
+                script = next_script
+                if note:
+                    note = f"（已切换剧本：{script}）\n" + note
+
+            if note and len(transcript) < max_messages:
+                transcript.append(
+                    {
+                        "agent_id": "",
+                        "agent_name": chairman_agent.name if chairman_agent else "Chairman",
+                        "model": chairman_spec,
+                        "message": note,
+                    }
+                )
+
+            if action == "converge":
+                break
+
+    if conversation_id:
+        trace_append(
+            conversation_id,
+            {
+                "type": "stage_complete",
+                "stage": "stage2b_lively",
+                "ok_count": len(transcript),
+                "script": script,
+                "script_history": script_history,
+                "turns_used": turns_used,
+                "leaders": leader_ids,
+                "mainline": mainline,
+            },
+        )
+
+    return {
+        "transcript": transcript,
+        "script": script,
+        "script_history": script_history,
+        "turns_used": turns_used,
+        "messages_used": len(transcript),
+        "leaders": leader_ids,
+        "mainline": mainline,
+        "assignments": assignments,
+        "leader_reasoning": leader_pick.get("leader_reasoning") if isinstance(leader_pick, dict) else [],
+    }
+
+
 async def stage2c_fact_check(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
@@ -1008,7 +1600,9 @@ async def stage4_generate_report(
     if settings.auto_save_report_to_kb:
         conv = get_conversation(conversation_id) or {}
         title = f"讨论报告：{conv.get('title') or conversation_id}"
-        enabled_agent_ids = [a.id for a in agents if a.enabled]
+        # Bind the report only to agents selected in this conversation.
+        # If the conversation uses default agents (agent_ids=None), this returns all enabled agents.
+        enabled_agent_ids = [a.id for a in _get_conversation_agents(conversation_id)]
         kb_doc_id = await _save_report_to_kb(
             conversation_id=conversation_id,
             title=title,

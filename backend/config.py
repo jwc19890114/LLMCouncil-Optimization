@@ -33,6 +33,18 @@ NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 # Knowledge base (SQLite)
 KB_DB_PATH = str(PROJECT_ROOT / "data" / "kb.sqlite")
 
+# Knowledge base - continuous ingestion (optional)
+KB_WATCH_ENABLE = os.getenv("KB_WATCH_ENABLE", "").strip().lower() in ("1", "true", "yes", "on")
+_KB_WATCH_ROOTS = os.getenv("KB_WATCH_ROOTS", "").strip()
+if _KB_WATCH_ROOTS:
+    KB_WATCH_ROOTS = [p.strip() for p in _KB_WATCH_ROOTS.replace(";", ",").split(",") if p.strip()]
+else:
+    # Safe default: a dedicated folder under ./data
+    KB_WATCH_ROOTS = [str(PROJECT_ROOT / "data" / "kb_watch")]
+KB_WATCH_EXTS = [e.strip().lower().lstrip(".") for e in os.getenv("KB_WATCH_EXTS", "txt,md").split(",") if e.strip()]
+KB_WATCH_INTERVAL_SECONDS = max(2, int(os.getenv("KB_WATCH_INTERVAL_SECONDS", "10") or 10))
+KB_WATCH_MAX_FILE_MB = max(1, int(os.getenv("KB_WATCH_MAX_FILE_MB", "20") or 20))
+
 # Knowledge base - Hybrid retrieval (optional)
 # Embedding model spec: "<provider>:<model>"
 KB_EMBEDDING_MODEL = os.getenv("KB_EMBEDDING_MODEL", "")

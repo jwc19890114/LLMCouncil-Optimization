@@ -123,6 +123,108 @@
   word-break: break-word;
 }
 
+.kbpage-doc-titlebtn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.kbpage-doc-titlebtn:hover {
+  text-decoration: underline;
+}
+
+.kbdoc-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+}
+
+.kbdoc-modal {
+  width: min(980px, calc(100vw - 32px));
+  height: min(78vh, 860px);
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.kbdoc-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.kbdoc-title {
+  font-weight: 900;
+  color: #0f172a;
+}
+
+.kbdoc-close {
+  appearance: none;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.kbdoc-body {
+  padding: 12px 14px;
+  overflow: auto;
+}
+
+.kbdoc-meta {
+  font-size: 12px;
+  color: #64748b;
+  margin-bottom: 10px;
+}
+
+.kbdoc-meta-line {
+  margin: 2px 0;
+}
+
+.kbdoc-meta-k {
+  color: #334155;
+  font-weight: 700;
+}
+
+.kbdoc-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.kbdoc-content {
+  border-top: 1px solid #e2e8f0;
+  padding-top: 12px;
+}
+
+.kbdoc-pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0b1220;
+  color: #e2e8f0;
+  border-radius: 12px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 52vh;
+  overflow: auto;
+}
+
 .kbpage-doc-sub {
   font-size: 12px;
   color: #64748b;

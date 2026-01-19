@@ -1,5 +1,5 @@
 /**
- * API client for the LLM Council backend.
+ * API client for the SynthesisLab backend.
  */
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001';
@@ -109,6 +109,29 @@ export const api = {
     return response.json();
   },
 
+  // Plugins
+  async listPlugins() {
+    const response = await fetch(`${API_BASE}/api/plugins`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '加载插件失败'));
+    return response.json();
+  },
+
+  async patchPlugin(name, patch) {
+    const response = await fetch(`${API_BASE}/api/plugins/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch || {}),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '更新插件失败'));
+    return response.json();
+  },
+
+  async reloadPlugins() {
+    const response = await fetch(`${API_BASE}/api/plugins/reload`, { method: 'POST' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '刷新插件失败'));
+    return response.json();
+  },
+
   /**
    * List all conversations.
    */
@@ -181,6 +204,64 @@ export const api = {
     return response.json();
   },
 
+  async setConversationDiscussion(
+    conversationId,
+    {
+      discussion_mode = null,
+      serious_iteration_rounds = null,
+      lively_script = null,
+      lively_max_messages = null,
+      lively_max_turns = null,
+    } = {}
+  ) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/discussion`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        discussion_mode,
+        serious_iteration_rounds,
+        lively_script,
+        lively_max_messages,
+        lively_max_turns,
+      }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '设置讨论模式失败'));
+    return response.json();
+  },
+
+  // Jobs
+  async listJobs({ conversation_id = '', status = '', limit = 50 } = {}) {
+    const url = new URL(`${API_BASE}/api/jobs`);
+    if (conversation_id) url.searchParams.set('conversation_id', conversation_id);
+    if (status) url.searchParams.set('status', status);
+    if (limit) url.searchParams.set('limit', String(limit));
+    const response = await fetch(url.toString(), { cache: 'no-store' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '加载任务列表失败'));
+    return response.json();
+  },
+
+  async getJob(jobId) {
+    const response = await fetch(`${API_BASE}/api/jobs/${jobId}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '加载任务失败'));
+    return response.json();
+  },
+
+  async cancelJob(jobId) {
+    const response = await fetch(`${API_BASE}/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '取消任务失败'));
+    return response.json();
+  },
+
+  async createJob({ job_type, conversation_id = '', payload = {} } = {}) {
+    const response = await fetch(`${API_BASE}/api/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_type, conversation_id, payload }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '创建任务失败'));
+    return response.json();
+  },
+
   async invokeConversationAgent(conversationId, { action, agent_id, content = '', report_requirements = '' } = {}) {
     const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/invoke`, {
       method: 'POST',
@@ -221,6 +302,16 @@ export const api = {
     return response.json();
   },
 
+  async saveConversationReportToKB(conversationId) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/report/save_to_kb`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+      throw new Error(await getErrorMessage(response, '保存报告到知识库失败'));
+    }
+    return response.json();
+  },
+
   async getConversationTrace(conversationId) {
     const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/trace`);
     if (!response.ok) {
@@ -243,6 +334,15 @@ export const api = {
       body: JSON.stringify(doc),
     });
     if (!response.ok) throw new Error(await getErrorMessage(response, '新增知识库文档失败'));
+    return response.json();
+  },
+
+  async uploadKBDocumentFile(formData) {
+    const response = await fetch(`${API_BASE}/api/kb/documents/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, '上传文件失败'));
     return response.json();
   },
 

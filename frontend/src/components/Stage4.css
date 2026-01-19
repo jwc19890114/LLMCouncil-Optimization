@@ -18,9 +18,24 @@
   margin-bottom: 10px;
 }
 
+.stage4-btn {
+  appearance: none;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #0f172a;
+  border-radius: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.stage4-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .stage4-content {
   font-size: 13px;
   color: #0f172a;
   line-height: 1.65;
 }
-

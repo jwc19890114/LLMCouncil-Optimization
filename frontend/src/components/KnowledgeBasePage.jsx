@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
 import { api } from '../api';
+import Markdown from './Markdown';
 import MultiSelectDropdown from './MultiSelectDropdown';
 import './KnowledgeBasePage.css';
 
@@ -32,12 +32,18 @@ function isMarkdownFile(filename) {
   return n.endsWith('.md') || n.endsWith('.markdown');
 }
 
+function isOfficeFile(filename) {
+  const n = (filename || '').toLowerCase();
+  return n.endsWith('.docx') || n.endsWith('.xlsx');
+}
+
 export default function KnowledgeBasePage({ onBack }) {
   const [docs, setDocs] = useState([]);
   const [agents, setAgents] = useState([]);
   const [selectedAgentIds, setSelectedAgentIds] = useState(new Set());
   const [categories, setCategories] = useState([]);
-  const [batchItems, setBatchItems] = useState([]); // [{ filename, isMarkdown, title, source, text, size }]
+  const [batchItems, setBatchItems] = useState([]); // [{ filename, isMarkdown, title, source, text, size, file? }]
+  const [selectedFile, setSelectedFile] = useState(null); // File for docx/xlsx
   const [filename, setFilename] = useState('');
   const [isMarkdown, setIsMarkdown] = useState(false);
   const [title, setTitle] = useState('');
@@ -48,6 +54,13 @@ export default function KnowledgeBasePage({ onBack }) {
   const [showPreview, setShowPreview] = useState(true);
   const [editingDocId, setEditingDocId] = useState(null);
   const [editingDocCategories, setEditingDocCategories] = useState([]);
+
+  const [isDetailOpen, setIsDetailOpen] = useState(false);
+  const [detailDocId, setDetailDocId] = useState('');
+  const [detailDoc, setDetailDoc] = useState(null);
+  const [detailError, setDetailError] = useState('');
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailMode, setDetailMode] = useState('render'); // render | raw
 
   const enabledAgents = useMemo(() => agents.filter((a) => a.enabled), [agents]);
   const isBatch = useMemo(() => Array.isArray(batchItems) && batchItems.length > 0, [batchItems]);
@@ -86,6 +99,24 @@ export default function KnowledgeBasePage({ onBack }) {
     };
   }, []);
 
+  async function openDetail(docId) {
+    const id = String(docId || '').trim();
+    if (!id) return;
+    setIsDetailOpen(true);
+    setDetailDocId(id);
+    setDetailDoc(null);
+    setDetailError('');
+    setDetailLoading(true);
+    try {
+      const resp = await api.getKBDocument(id);
+      setDetailDoc(resp?.document || null);
+    } catch (e) {
+      setDetailError(e?.message || '加载详情失败');
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
   function toggleAgent(id) {
     setSelectedAgentIds((prev) => {
       const next = new Set(prev);
@@ -122,20 +153,23 @@ export default function KnowledgeBasePage({ onBack }) {
         for (const f of picked) {
           const name = f.name || '';
           const md = isMarkdownFile(name);
+          const office = isOfficeFile(name);
           if (f.size > 8 * 1024 * 1024) {
             setError('包含超大文件（>8MB），建议拆分后上传以提升检索与抽取效果。');
           }
-          const content = await f.text();
+          const content = office ? '' : await f.text();
           items.push({
             filename: name,
             isMarkdown: md,
-            title: inferTitle({ filename: name, text: content, isMarkdown: md }),
+            title: office ? (fileStem(name) || name || '未命名文档') : inferTitle({ filename: name, text: content, isMarkdown: md }),
             source: name,
             text: content,
             size: f.size,
+            file: office ? f : null,
           });
         }
         setBatchItems(items);
+        setSelectedFile(null);
         setFilename('');
         setIsMarkdown(false);
         setTitle('');
@@ -154,7 +188,9 @@ export default function KnowledgeBasePage({ onBack }) {
 
     const name = f.name || '';
     const md = isMarkdownFile(name);
+    const office = isOfficeFile(name);
     setBatchItems([]);
+    setSelectedFile(office ? f : null);
     setFilename(name);
     setIsMarkdown(md);
     setSource(name);
@@ -164,9 +200,15 @@ export default function KnowledgeBasePage({ onBack }) {
     }
 
     try {
-      const content = await f.text();
-      setText(content);
-      setTitle(inferTitle({ filename: name, text: content, isMarkdown: md }));
+      if (office) {
+        setText('');
+        setTitle(fileStem(name) || name || '未命名文档');
+        setShowPreview(false);
+      } else {
+        const content = await f.text();
+        setText(content);
+        setTitle(inferTitle({ filename: name, text: content, isMarkdown: md }));
+      }
     } catch (e) {
       setError(e?.message || '读取文件失败');
     }
@@ -174,19 +216,29 @@ export default function KnowledgeBasePage({ onBack }) {
 
   async function saveDoc() {
     setError('');
-    if (!title.trim() || !text.trim()) {
-      setError('标题和内容不能为空');
-      return;
-    }
     setIsLoading(true);
     try {
-      await api.addKBDocument({
-        title,
-        source,
-        text,
-        categories,
-        agent_ids: Array.from(selectedAgentIds),
-      });
+      if (selectedFile) {
+        const form = new FormData();
+        form.append('file', selectedFile);
+        form.append('title', title.trim() || fileStem(filename) || '未命名文档');
+        form.append('source', source || filename || '');
+        form.append('categories_json', JSON.stringify(categories || []));
+        form.append('agent_ids_json', JSON.stringify(Array.from(selectedAgentIds)));
+        await api.uploadKBDocumentFile(form);
+      } else {
+        if (!title.trim() || !text.trim()) {
+          setError('标题和内容不能为空');
+          return;
+        }
+        await api.addKBDocument({
+          title,
+          source,
+          text,
+          categories,
+          agent_ids: Array.from(selectedAgentIds),
+        });
+      }
       setFilename('');
       setIsMarkdown(false);
       setTitle('');
@@ -194,6 +246,7 @@ export default function KnowledgeBasePage({ onBack }) {
       setText('');
       setCategories([]);
       setSelectedAgentIds(new Set());
+      setSelectedFile(null);
       await reload();
     } catch (e) {
       setError(e?.message || '保存失败');
@@ -229,25 +282,52 @@ export default function KnowledgeBasePage({ onBack }) {
 
     setIsLoading(true);
     try {
-      const documents = items.map((it) => ({
-        title: (it.title || '').trim() || fileStem(it.filename) || '未命名文档',
-        source: it.source || it.filename || '',
-        text: it.text || '',
-        categories,
-        agent_ids: Array.from(selectedAgentIds),
-      }));
-      const resp = await api.addKBDocumentsBatch({ documents });
-      const okCount = (resp?.results || []).filter((r) => r?.ok).length;
-      const failCount = (resp?.results || []).filter((r) => !r?.ok).length;
+      const officeItems = items.filter((it) => it?.file);
+      const textItems = items.filter((it) => !it?.file);
+
+      let okCount = 0;
+      let failCount = 0;
+
+      if (textItems.length > 0) {
+        const documents = textItems.map((it) => ({
+          title: (it.title || '').trim() || fileStem(it.filename) || '未命名文档',
+          source: it.source || it.filename || '',
+          text: it.text || '',
+          categories,
+          agent_ids: Array.from(selectedAgentIds),
+        }));
+        const resp = await api.addKBDocumentsBatch({ documents });
+        okCount += (resp?.results || []).filter((r) => r?.ok).length;
+        failCount += (resp?.results || []).filter((r) => !r?.ok).length;
+        if ((resp?.results || []).some((r) => !r?.ok)) {
+          console.log('KB batch response:', resp);
+        }
+      }
+
+      for (const it of officeItems) {
+        try {
+          const form = new FormData();
+          form.append('file', it.file);
+          form.append('title', (it.title || '').trim() || fileStem(it.filename) || '未命名文档');
+          form.append('source', it.source || it.filename || '');
+          form.append('categories_json', JSON.stringify(categories || []));
+          form.append('agent_ids_json', JSON.stringify(Array.from(selectedAgentIds)));
+          await api.uploadKBDocumentFile(form);
+          okCount += 1;
+        } catch (e) {
+          failCount += 1;
+        }
+      }
+
       if (failCount > 0) {
-        setError(`批量入库完成：成功 ${okCount}，失败 ${failCount}（可打开控制台查看详细返回）`);
-        console.log('KB batch response:', resp);
+        setError(`批量入库完成：成功 ${okCount}，失败 ${failCount}`);
       } else {
         alert(`批量入库完成：成功 ${okCount}`);
       }
       setBatchItems([]);
       setCategories([]);
       setSelectedAgentIds(new Set());
+      setSelectedFile(null);
       await reload();
     } catch (e) {
       setError(e?.message || '批量保存失败');
@@ -275,7 +355,7 @@ export default function KnowledgeBasePage({ onBack }) {
       <div className="kbpage-toolbar">
         <div className="kbpage-toolbar-left">
           <div className="kbpage-title">知识库上传</div>
-          <div className="kbpage-subtitle">支持解析 .txt / .md，并自动生成标题与预览</div>
+          <div className="kbpage-subtitle">支持 .txt / .md / .docx / .xlsx，并自动生成标题与预览（Office 文件在入库时解析）</div>
         </div>
         <div className="kbpage-toolbar-right">
           <button className="kbpage-btn" onClick={reload} disabled={isLoading}>
@@ -302,7 +382,14 @@ export default function KnowledgeBasePage({ onBack }) {
                   {docs.map((d) => (
                     <div key={d.id} className="kbpage-doc">
                       <div className="kbpage-doc-main">
-                        <div className="kbpage-doc-title">{d.title}</div>
+                        <button
+                          type="button"
+                          className="kbpage-doc-title kbpage-doc-titlebtn"
+                          onClick={() => openDetail(d.id)}
+                          title="查看详情"
+                        >
+                          {d.title}
+                        </button>
                         <div className="kbpage-doc-sub">
                           <span className="kbpage-doc-id">id: {d.id}</span>
                           {d.source ? <span> · {d.source}</span> : null}
@@ -345,6 +432,9 @@ export default function KnowledgeBasePage({ onBack }) {
                         )}
                       </div>
                       <div className="kbpage-doc-actions">
+                        <button className="kbpage-btn" onClick={() => openDetail(d.id)} disabled={isLoading}>
+                          详情
+                        </button>
                         <button
                           className="kbpage-btn"
                           onClick={() => {
@@ -374,7 +464,7 @@ export default function KnowledgeBasePage({ onBack }) {
                   <input
                     type="file"
                     multiple
-                    accept=".txt,.md,.markdown,text/plain,text/markdown"
+                    accept=".txt,.md,.markdown,.json,.csv,.docx,.xlsx,text/plain,text/markdown,application/json"
                     onChange={(e) => handleFiles(e.target.files)}
                   />
                 </label>
@@ -508,7 +598,7 @@ export default function KnowledgeBasePage({ onBack }) {
                     ) : !text || isBatch ? (
                       <div className="kbpage-hint">上传文件或粘贴内容后显示预览</div>
                     ) : isMarkdown ? (
-                      <ReactMarkdown>{text}</ReactMarkdown>
+                      <Markdown>{text}</Markdown>
                     ) : (
                       <pre className="kbpage-pre">{text}</pre>
                     )}
@@ -548,6 +638,99 @@ export default function KnowledgeBasePage({ onBack }) {
           </div>
         </div>
       </div>
+
+      {isDetailOpen ? (
+        <div className="kbdoc-overlay" onMouseDown={() => setIsDetailOpen(false)}>
+          <div className="kbdoc-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="kbdoc-header">
+              <div className="kbdoc-title">知识详情</div>
+              <button className="kbdoc-close" onClick={() => setIsDetailOpen(false)}>
+                ✕
+              </button>
+            </div>
+
+            <div className="kbdoc-body">
+              <div className="kbdoc-meta">
+                <div className="kbdoc-meta-line">
+                  <span className="kbdoc-meta-k">doc_id:</span> <span className="kbdoc-meta-v">{detailDocId}</span>
+                </div>
+                {detailDoc?.title ? (
+                  <div className="kbdoc-meta-line">
+                    <span className="kbdoc-meta-k">标题:</span> <span className="kbdoc-meta-v">{detailDoc.title}</span>
+                  </div>
+                ) : null}
+                {detailDoc?.source ? (
+                  <div className="kbdoc-meta-line">
+                    <span className="kbdoc-meta-k">来源:</span> <span className="kbdoc-meta-v">{detailDoc.source}</span>
+                  </div>
+                ) : null}
+                {detailDoc?.created_at ? (
+                  <div className="kbdoc-meta-line">
+                    <span className="kbdoc-meta-k">创建时间:</span> <span className="kbdoc-meta-v">{detailDoc.created_at}</span>
+                  </div>
+                ) : null}
+                {Array.isArray(detailDoc?.categories) && detailDoc.categories.length > 0 ? (
+                  <div className="kbdoc-meta-line">
+                    <span className="kbdoc-meta-k">分类:</span>{' '}
+                    <span className="kbdoc-meta-v">{detailDoc.categories.join(' / ')}</span>
+                  </div>
+                ) : null}
+                {Array.isArray(detailDoc?.agent_ids) && detailDoc.agent_ids.length > 0 ? (
+                  <div className="kbdoc-meta-line">
+                    <span className="kbdoc-meta-k">绑定专家:</span>{' '}
+                    <span className="kbdoc-meta-v">{detailDoc.agent_ids.join(', ')}</span>
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="kbdoc-actions">
+                <button
+                  className={`kbpage-btn ${detailMode === 'render' ? 'primary' : ''}`}
+                  onClick={() => setDetailMode('render')}
+                  disabled={detailLoading}
+                >
+                  渲染
+                </button>
+                <button
+                  className={`kbpage-btn ${detailMode === 'raw' ? 'primary' : ''}`}
+                  onClick={() => setDetailMode('raw')}
+                  disabled={detailLoading}
+                >
+                  原文
+                </button>
+                <button
+                  className="kbpage-btn secondary"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(String(detailDoc?.text || ''));
+                    } catch (e) {
+                      void e;
+                    }
+                  }}
+                  disabled={detailLoading || !detailDoc?.text}
+                >
+                  复制全文
+                </button>
+              </div>
+
+              {detailLoading ? <div className="kbpage-hint">加载中...</div> : null}
+              {detailError ? <div className="kbpage-error">{detailError}</div> : null}
+
+              {!detailLoading && detailDoc ? (
+                <div className="kbdoc-content">
+                  {detailMode === 'raw' ? (
+                    <pre className="kbdoc-pre">{detailDoc.text || ''}</pre>
+                  ) : (
+                    <div className="markdown-content">
+                      <Markdown>{detailDoc.text || ''}</Markdown>
+                    </div>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

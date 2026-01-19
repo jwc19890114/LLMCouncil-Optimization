@@ -47,6 +47,7 @@ async def _query_openai_compatible(
     messages: List[Dict[str, str]],
     timeout: float,
     headers_extra: Optional[Dict[str, str]] = None,
+    silent: bool = False,
 ) -> Optional[Dict[str, Any]]:
     headers = {
         "Content-Type": "application/json",
@@ -72,7 +73,8 @@ async def _query_openai_compatible(
                 "reasoning_details": reasoning_details,
             }
     except Exception as e:
-        print(f"Error querying OpenAI-compatible endpoint {url} model {model}: {e}")
+        if not silent:
+            print(f"Error querying OpenAI-compatible endpoint {url} model {model}: {e}")
         return None
 
 
@@ -84,6 +86,7 @@ async def _query_openai_compatible_embeddings(
     inputs: List[str],
     timeout: float,
     headers_extra: Optional[Dict[str, str]] = None,
+    silent: bool = False,
 ) -> Optional[List[List[float]]]:
     headers = {
         "Content-Type": "application/json",
@@ -111,7 +114,8 @@ async def _query_openai_compatible_embeddings(
                 return None
             return vectors  # type: ignore[return-value]
     except Exception as e:
-        print(f"Error querying embeddings endpoint {url} model {model}: {e}")
+        if not silent:
+            print(f"Error querying embeddings endpoint {url} model {model}: {e}")
         return None
 
 
@@ -186,6 +190,8 @@ async def query_model(
     spec: str,
     messages: List[Dict[str, str]],
     timeout: float = 120.0,
+    *,
+    silent: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Query a model from one of the supported providers.
@@ -202,6 +208,7 @@ async def query_model(
             model=parsed.model,
             messages=messages,
             timeout=timeout,
+            silent=silent,
         )
 
     if parsed.provider == "dashscope":
@@ -212,6 +219,7 @@ async def query_model(
             model=parsed.model,
             messages=messages,
             timeout=timeout,
+            silent=silent,
         )
 
     if parsed.provider == "apiyi":
@@ -222,6 +230,7 @@ async def query_model(
             model=parsed.model,
             messages=messages,
             timeout=timeout,
+            silent=silent,
         )
 
     if parsed.provider == "ollama":
@@ -253,6 +262,8 @@ async def embed_texts(
     spec: str,
     texts: List[str],
     timeout: float = 120.0,
+    *,
+    silent: bool = False,
 ) -> Optional[List[List[float]]]:
     """
     Get embeddings for a list of texts.
@@ -273,6 +284,7 @@ async def embed_texts(
             model=parsed.model,
             inputs=texts,
             timeout=timeout,
+            silent=silent,
         )
 
     if parsed.provider == "dashscope":
@@ -283,6 +295,7 @@ async def embed_texts(
             model=parsed.model,
             inputs=texts,
             timeout=timeout,
+            silent=silent,
         )
 
     if parsed.provider == "apiyi":
@@ -293,6 +306,7 @@ async def embed_texts(
             model=parsed.model,
             inputs=texts,
             timeout=timeout,
+            silent=silent,
         )
 
     if parsed.provider == "ollama":
