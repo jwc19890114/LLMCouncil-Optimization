@@ -208,6 +208,119 @@
   line-height: 1.5;
 }
 
+.grow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gcheck {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #334155;
+  user-select: none;
+}
+
+.gcheck input {
+  width: 16px;
+  height: 16px;
+}
+
+.gjobs {
+  border-top: 1px dashed #e2e8f0;
+  padding-top: 10px;
+  margin-top: 4px;
+}
+
+.gjobs-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  font-weight: 900;
+  color: #0f172a;
+}
+
+.gjobs-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gjobs-item {
+  border: 1px solid #eef2f7;
+  border-radius: 12px;
+  padding: 10px;
+  background: #ffffff;
+}
+
+.gjobs-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+  color: #64748b;
+}
+
+.gjobs-status {
+  font-weight: 900;
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  color: #0f172a;
+}
+
+.gjobs-status.s-running {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #1d4ed8;
+}
+
+.gjobs-status.s-succeeded {
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.gjobs-status.s-failed {
+  background: #fff1f2;
+  border-color: #fecaca;
+  color: #9f1239;
+}
+
+.gjobs-status.s-canceled {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+  color: #475569;
+}
+
+.gjobs-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
+    monospace;
+  color: #334155;
+}
+
+.gjobs-summary {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #0f172a;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.gjobs-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
 .gcanvas-wrap {
   position: relative;
   flex: 1;

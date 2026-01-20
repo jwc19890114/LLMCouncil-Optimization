@@ -9,7 +9,7 @@ Ported to align with MiroFish-Optimize strategy:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from .llm_client import query_model
 from .settings_store import get_settings
@@ -43,6 +43,25 @@ def split_text(text: str, chunk_size: int = 1200, chunk_overlap: int = 120) -> L
             out.append(chunk)
         i += step
     return out
+
+
+def iter_split_text(text: str, chunk_size: int = 1200, chunk_overlap: int = 120):
+    """
+    Generator version of split_text to avoid materializing all chunks in memory.
+
+    Yields chunks as strings.
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+    step = max(1, int(chunk_size) - int(chunk_overlap))
+    i = 0
+    n = len(text)
+    while i < n:
+        chunk = text[i : i + int(chunk_size)].strip()
+        if chunk:
+            yield chunk
+        i += step
 
 
 def _extract_allowed_types(ontology: Dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -242,3 +261,28 @@ async def extract_kg_incremental(
         all_relations.extend(rels)
 
     return {"chunks": per_chunk, "entities": all_entities, "relations": all_relations, "ontology": ont}
+
+
+async def iter_extract_kg_chunks(
+    *,
+    model_spec: str,
+    text: str,
+    ontology: Optional[Dict[str, Any]] = None,
+    timeout: float = 120.0,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 120,
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Memory-efficient incremental extractor.
+
+    Yields per-chunk extraction results without accumulating all chunks/entities/relations in memory.
+
+    Yields:
+      {"index": int, "text": str, "text_len": int, "entities": [...], "relations": [...], "ontology": {...}}
+    """
+    ont = ontology or DEFAULT_ONTOLOGY
+    for idx, c in enumerate(iter_split_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)):
+        extracted = await extract_kg(model_spec=model_spec, text=c, ontology=ont, timeout=timeout)
+        ents = extracted.get("entities") or []
+        rels = extracted.get("relations") or []
+        yield {"index": idx, "text": c, "text_len": len(c), "entities": ents, "relations": rels, "ontology": ont}

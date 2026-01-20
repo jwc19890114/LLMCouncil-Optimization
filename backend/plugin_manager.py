@@ -35,6 +35,7 @@ BUILTIN_META: Dict[str, Dict[str, str]] = {
     "web_search": {"title": "网页检索", "description": "基于 DDG 的网页检索，返回标题/URL/摘要。"},
     "evidence_pack": {"title": "证据整理", "description": "网页检索 + 本会话绑定 KB（FTS）证据打包，便于后续引用。"},
     "office_ingest": {"title": "Office 导入", "description": "读取 .docx/.xlsx 文档，提取为纯文本并写入知识库（可选索引 embedding）。"},
+    "paper_search": {"title": "论文检索", "description": "检索 arXiv / Google Scholar / CNKI 的论文元数据（题目/作者/摘要）。"},
 }
 
 

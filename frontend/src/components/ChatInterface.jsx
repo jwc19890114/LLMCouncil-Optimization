@@ -13,6 +13,7 @@ import './ChatInterface.css';
 export default function ChatInterface({
   conversation,
   onSendMessage,
+  onInterrupt,
   isLoading,
   onExportConversation,
   onSelectAgents,
@@ -35,9 +36,16 @@ export default function ChatInterface({
   const [isJobsOpen, setIsJobsOpen] = useState(false);
   const [jobs, setJobs] = useState([]);
   const [jobsError, setJobsError] = useState('');
+  const [jobResultOpen, setJobResultOpen] = useState(false);
+  const [jobResultJob, setJobResultJob] = useState(null);
   const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
   const [evidenceQuery, setEvidenceQuery] = useState('');
-  const [evidenceMode, setEvidenceMode] = useState('evidence_pack'); // web_search | evidence_pack
+  const [evidenceMode, setEvidenceMode] = useState('evidence_pack'); // web_search | evidence_pack | paper_search
+  const [isTitleOpen, setIsTitleOpen] = useState(false);
+  const [titleDraft, setTitleDraft] = useState('');
+  const [paperSources, setPaperSources] = useState(() => ['arxiv']);
+  const [paperMaxResults, setPaperMaxResults] = useState(5);
+  const [expandedJobResultIdxs, setExpandedJobResultIdxs] = useState([]);
   const [trace, setTrace] = useState([]);
   const [showTrace, setShowTrace] = useState(false);
   const [traceError, setTraceError] = useState('');
@@ -117,6 +125,55 @@ export default function ChatInterface({
       clearInterval(timer);
     };
   }, [isJobsOpen, conversation?.id]);
+
+  const formatRelativeSeconds = (seconds) => {
+    const s = Math.max(0, Math.round(Number(seconds) || 0));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    if (m < 60) return r ? `${m}m${r}s` : `${m}m`;
+    const h = Math.floor(m / 60);
+    const mr = m % 60;
+    return mr ? `${h}h${mr}m` : `${h}h`;
+  };
+
+  const getJobRetryHint = (j) => {
+    const maxAttempts = Number(j?.max_attempts || 0);
+    const attempts = Number(j?.attempts || 0);
+    const runAfter = Number(j?.run_after_ts || 0);
+    if (maxAttempts <= 0 && attempts <= 0 && runAfter <= 0) return '';
+    const parts = [];
+    if (maxAttempts > 0) parts.push(`重试：${attempts}/${maxAttempts}`);
+    if (runAfter > 0) {
+      const now = Date.now() / 1000;
+      if (runAfter > now) parts.push(`下次：${formatRelativeSeconds(runAfter - now)} 后`);
+    }
+    return parts.join(' · ');
+  };
+
+  const getJobTimeoutHint = (j) => {
+    const t = Number(j?.payload?.timeout_seconds || 0);
+    if (!t || t <= 0) return '';
+    return `超时：${formatRelativeSeconds(t)}`;
+  };
+
+  const formatEpoch = (ts) => {
+    const v = Number(ts || 0);
+    if (!v || v <= 0) return '';
+    try {
+      const d = new Date(v * 1000);
+      if (Number.isNaN(d.getTime())) return '';
+      return d.toLocaleString();
+    } catch {
+      return '';
+    }
+  };
+
+  const shortId = (s, n = 8) => {
+    const v = String(s || '').trim();
+    if (!v) return '';
+    return v.length <= n ? v : v.slice(0, n);
+  };
 
   function parseSlashContext(text) {
     const v = String(text || '');
@@ -229,7 +286,7 @@ export default function ChatInterface({
   const handleSubmit = (e) => {
     e.preventDefault();
     const raw = (input || '').trim();
-    if (!raw || isLoading || isUploading || isInvoking) return;
+    if (!raw || isUploading || isInvoking) return;
 
     if (raw.startsWith('/')) {
       const ctx = parseSlashContext(raw);
@@ -316,7 +373,7 @@ export default function ChatInterface({
       return;
     }
 
-    onSendMessage(input);
+    onSendMessage(raw);
     setInput('');
   };
 
@@ -395,6 +452,17 @@ export default function ChatInterface({
       <div className="chat-toolbar">
         <div className="chat-toolbar-left">
           <div className="chat-title">{conversation.title || 'Conversation'}</div>
+          <button
+            type="button"
+            className="toolbar-btn"
+            onClick={() => {
+              setTitleDraft(conversation.title || '');
+              setIsTitleOpen(true);
+            }}
+            title="修改会话标题"
+          >
+            改标题
+          </button>
         </div>
         <div className="chat-toolbar-right">
           <input
@@ -478,7 +546,7 @@ export default function ChatInterface({
           >
             讨论模式
           </button>
-          <button className="toolbar-btn" onClick={() => setIsJobsOpen(true)} disabled={isLoading || isUploading}>
+          <button className="toolbar-btn" onClick={() => setIsJobsOpen(true)} disabled={isUploading}>
             任务
           </button>
           <button
@@ -486,9 +554,14 @@ export default function ChatInterface({
             onClick={() => {
               setEvidenceQuery('');
               setEvidenceMode('evidence_pack');
+              setPaperSources(['arxiv']);
+              setPaperMaxResults(5);
+              setExpandedJobResultIdxs([]);
+              setUploadError('');
+              setUploadNotice('');
               setIsEvidenceOpen(true);
             }}
-            disabled={isLoading || isUploading}
+            disabled={isUploading}
           >
             证据
           </button>
@@ -499,6 +572,52 @@ export default function ChatInterface({
       </div>
 
       {uploadNotice ? <div className="chat-notice">{uploadNotice}</div> : null}
+
+      {isTitleOpen && (
+        <div className="chat-modal-overlay" onClick={() => setIsTitleOpen(false)}>
+          <div className="chat-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-modal-header">
+              <div className="chat-modal-title">修改会话标题</div>
+              <button className="chat-modal-close" onClick={() => setIsTitleOpen(false)}>
+                ✕
+              </button>
+            </div>
+            <div className="chat-modal-body">
+              <input
+                className="chat-modal-input"
+                value={titleDraft}
+                onChange={(e) => setTitleDraft(e.target.value)}
+                placeholder="输入更准确的标题（最多 80 字）"
+              />
+              <div className="chat-modal-hint">标题会显示在左侧会话列表中，便于管理与检索。</div>
+            </div>
+            <div className="chat-modal-actions">
+              <button className="toolbar-btn" onClick={() => setIsTitleOpen(false)}>
+                取消
+              </button>
+              <button
+                className="toolbar-btn primary"
+                onClick={async () => {
+                  const t = String(titleDraft || '').trim();
+                  if (!t) {
+                    setUploadError('标题不能为空');
+                    return;
+                  }
+                  try {
+                    await api.setConversationTitle(conversation.id, t);
+                    setIsTitleOpen(false);
+                    await onRefreshConversation?.();
+                  } catch (err) {
+                    setUploadError(err?.message || '修改标题失败');
+                  }
+                }}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {isReportReqOpen && (
         <div className="chat-modal-overlay" onClick={() => setIsReportReqOpen(false)}>
@@ -692,8 +811,42 @@ export default function ChatInterface({
                           <span className="jobs-progress">{Math.round(j.progress * 100)}%</span>
                         ) : null}
                       </div>
+                      {getJobRetryHint(j) || getJobTimeoutHint(j) ? (
+                        <div className="jobs-summary">
+                          {[getJobRetryHint(j), getJobTimeoutHint(j)].filter(Boolean).join(' · ')}
+                        </div>
+                      ) : null}
+                      {j.idempotency_key || j.run_after_ts ? (
+                        <div className="jobs-summary">
+                          {[
+                            j.idempotency_key ? `key:${shortId(j.idempotency_key, 10)}` : '',
+                            j.run_after_ts ? `run_after:${formatEpoch(j.run_after_ts)}` : '',
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </div>
+                      ) : null}
                       {j.result?.summary ? <div className="jobs-summary">{j.result.summary}</div> : null}
+                      {j.result?.errors && Object.keys(j.result.errors || {}).length ? (
+                        <div className="trace-errorline">
+                          {`errors: ${Object.entries(j.result.errors)
+                            .map(([k, v]) => `${k}=${String(v || '').slice(0, 120)}`)
+                            .join(' | ')}`}
+                        </div>
+                      ) : null}
                       {j.error ? <div className="trace-errorline">{j.error}</div> : null}
+
+                      {Array.isArray(j?.result?.results) && j.result.results.length ? (
+                        <button
+                          className="toolbar-btn"
+                          onClick={() => {
+                            setJobResultJob(j);
+                            setJobResultOpen(true);
+                          }}
+                        >
+                          查看结果
+                        </button>
+                      ) : null}
                       {j.status === 'queued' || j.status === 'running' ? (
                         <button
                           className="toolbar-btn"
@@ -717,6 +870,107 @@ export default function ChatInterface({
         </div>
       )}
 
+      {jobResultOpen && jobResultJob ? (
+        <div
+          className="chat-modal-overlay"
+          onClick={() => {
+            setJobResultOpen(false);
+            setJobResultJob(null);
+            setExpandedJobResultIdxs([]);
+          }}
+        >
+          <div className="chat-modal job-result-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="chat-modal-header">
+              <div className="chat-modal-title">{`任务结果：${jobResultJob.job_type}`}</div>
+              <button
+                className="chat-modal-close"
+                onClick={() => {
+                  setJobResultOpen(false);
+                  setJobResultJob(null);
+                  setExpandedJobResultIdxs([]);
+                }}
+              >
+                ✕
+              </button>
+            </div>
+                <div className="chat-modal-body">
+                  {jobResultJob?.result?.summary ? (
+                    <div className="chat-modal-hint">{jobResultJob.result.summary}</div>
+                  ) : null}
+                  <div className="chat-modal-hint">
+                    提示：点击标题会在新标签页打开；长摘要可“展开/收起”，列表可滚动。
+                  </div>
+                  {jobResultJob?.result?.errors && Object.keys(jobResultJob.result.errors || {}).length ? (
+                    <div className="trace-error">
+                      {Object.entries(jobResultJob.result.errors)
+                        .map(([k, v]) => `${k}: ${String(v || '')}`)
+                        .join('\n')}
+                </div>
+              ) : null}
+              <div className="jobs-results">
+                {(jobResultJob?.result?.results || []).slice(0, 50).map((r, idx) => (
+                  <div key={idx} className="jobs-result-item">
+                    <div className="jobs-result-title">
+                      {r?.url ? (
+                        <a href={r.url} target="_blank" rel="noreferrer">
+                          {r?.title || r?.url}
+                        </a>
+                      ) : (
+                        <span>{r?.title || '(untitled)'}</span>
+                      )}
+                    </div>
+                    <div className="jobs-result-meta">
+                      {[r?.source ? `source:${r.source}` : '', r?.published ? `published:${r.published}` : '']
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </div>
+                    {Array.isArray(r?.authors) && r.authors.length ? (
+                      <div className="jobs-result-authors">{`authors: ${r.authors.join(', ')}`}</div>
+                    ) : null}
+                    {r?.abstract ? (
+                      <>
+                        {String(r.abstract || '').length > 260 ? (
+                          <button
+                            className="toolbar-btn"
+                            onClick={() => {
+                              setExpandedJobResultIdxs((prev) => {
+                                const has = prev.includes(idx);
+                                return has ? prev.filter((x) => x !== idx) : [...prev, idx];
+                              });
+                            }}
+                          >
+                            {expandedJobResultIdxs.includes(idx) ? '收起' : '展开'}
+                          </button>
+                        ) : null}
+                        <div
+                          className={`jobs-result-abstract ${
+                            expandedJobResultIdxs.includes(idx) ? 'expanded' : 'collapsed'
+                          }`}
+                        >
+                          {r.abstract}
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="chat-modal-actions">
+              <button
+                className="toolbar-btn"
+                onClick={() => {
+                  setJobResultOpen(false);
+                  setJobResultJob(null);
+                  setExpandedJobResultIdxs([]);
+                }}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {isEvidenceOpen && (
         <div className="chat-modal-overlay" onClick={() => setIsEvidenceOpen(false)}>
           <div className="chat-modal" onClick={(e) => e.stopPropagation()}>
@@ -735,8 +989,57 @@ export default function ChatInterface({
                 <select className="chat-modal-input" value={evidenceMode} onChange={(e) => setEvidenceMode(e.target.value)}>
                   <option value="evidence_pack">证据整理（网页+KB）</option>
                   <option value="web_search">网页检索</option>
+                  <option value="paper_search">论文检索（元数据）</option>
                 </select>
               </div>
+              {evidenceMode === 'paper_search' ? (
+                <>
+                  <div className="chat-modal-row">
+                    <div className="chat-modal-label">来源</div>
+                    <div className="chat-modal-input" style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                      {[
+                        { key: 'arxiv', label: 'arXiv' },
+                        { key: 'scholar', label: 'Google Scholar' },
+                        { key: 'cnki', label: 'CNKI' },
+                      ].map((s) => (
+                        <label key={s.key} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                          <input
+                            type="checkbox"
+                            checked={paperSources.includes(s.key)}
+                            onChange={(e) => {
+                              const on = e.target.checked;
+                              setPaperSources((prev) => {
+                                const set = new Set(prev);
+                                if (on) set.add(s.key);
+                                else set.delete(s.key);
+                                const next = Array.from(set);
+                                return next.length ? next : ['arxiv'];
+                              });
+                            }}
+                          />
+                          {s.label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="chat-modal-row">
+                    <div className="chat-modal-label">数量</div>
+                    <input
+                      className="chat-modal-input"
+                      type="number"
+                      min={1}
+                      max={20}
+                      step={1}
+                      value={paperMaxResults}
+                      onChange={(e) => {
+                        const n = Number(e.target.value || 5);
+                        const v = Math.max(1, Math.min(20, Number.isFinite(n) ? n : 5));
+                        setPaperMaxResults(v);
+                      }}
+                    />
+                  </div>
+                </>
+              ) : null}
               <div className="chat-modal-row">
                 <div className="chat-modal-label">查询</div>
                 <input
@@ -746,9 +1049,10 @@ export default function ChatInterface({
                   placeholder="输入要检索/整理证据的关键词或问题"
                 />
               </div>
+              {uploadError ? <div className="trace-error">{uploadError}</div> : null}
             </div>
             <div className="chat-modal-actions">
-              <button className="toolbar-btn" onClick={() => setIsEvidenceOpen(false)} disabled={isLoading}>
+              <button className="toolbar-btn" onClick={() => setIsEvidenceOpen(false)}>
                 取消
               </button>
               <button
@@ -760,14 +1064,17 @@ export default function ChatInterface({
                     return;
                   }
                   try {
-                    await api.createJob({
-                      job_type: evidenceMode,
-                      conversation_id: conversation?.id || '',
-                      payload:
-                        evidenceMode === 'web_search'
-                          ? { query: q, max_results: 5 }
-                          : { query: q, max_web_results: 5, max_kb_chunks: 6 },
-                    });
+                    setUploadError('');
+                      await api.createJob({
+                        job_type: evidenceMode,
+                        conversation_id: conversation?.id || '',
+                        payload:
+                          evidenceMode === 'web_search'
+                          ? { query: q, max_results: 10, save_to_kb: true }
+                          : evidenceMode === 'paper_search'
+                            ? { query: q, sources: paperSources, max_results: paperMaxResults }
+                            : { query: q, max_web_results: 5, max_kb_chunks: 6, save_to_kb: true },
+                      });
                     setIsEvidenceOpen(false);
                     setUploadNotice('已创建后台任务，完成后会自动回填到下一轮讨论上下文，可在“任务”中查看进度。');
                     setTimeout(() => setUploadNotice(''), 6000);
@@ -775,7 +1082,7 @@ export default function ChatInterface({
                     setUploadError(err?.message || '创建任务失败');
                   }
                 }}
-                disabled={isLoading}
+                disabled={isUploading}
               >
                 开始
               </button>
@@ -858,6 +1165,15 @@ export default function ChatInterface({
               ) : (
                 <div className="assistant-message">
                   <div className="message-label">专家委员会</div>
+
+                  {msg.event ? (
+                    <div className="stage2b" style={{ marginTop: 0 }}>
+                      <div className="stage2b-title">{msg.event.title || '后台事件'}</div>
+                      <div className="stage2b-content">
+                        <Markdown>{msg.event.content || ''}</Markdown>
+                      </div>
+                    </div>
+                  ) : null}
 
                   {msg.direct ? (
                     <div className="stage2b" style={{ marginTop: 0 }}>
@@ -1003,7 +1319,7 @@ export default function ChatInterface({
             }
             handleKeyDown(e);
           }}
-          disabled={isLoading || isInvoking}
+          disabled={isInvoking}
           rows={3}
         />
         {slashOpen && slashItems.length > 0 && (
@@ -1027,10 +1343,21 @@ export default function ChatInterface({
         <button
           type="submit"
           className="send-button"
-          disabled={!input.trim() || isLoading || isUploading || isInvoking}
+          disabled={!input.trim() || isUploading || isInvoking}
         >
-          发送
+          {isLoading ? '打断并发送' : '发送'}
         </button>
+        {isLoading ? (
+          <button
+            type="button"
+            className="send-button"
+            onClick={() => onInterrupt?.()}
+            disabled={!isLoading}
+            title="打断当前讨论（停止生成）"
+          >
+            打断
+          </button>
+        ) : null}
       </form>
     </div>
   );

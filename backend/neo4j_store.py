@@ -56,7 +56,10 @@ class KGRelation:
 class KGChunk:
     graph_id: str
     chunk_id: str
-    text: str
+    text_preview: str = ""
+    kb_doc_id: str = ""
+    kb_chunk_id: str = ""
+    source: str = ""
     created_at: Optional[str] = None
 
 
@@ -78,10 +81,12 @@ class Neo4jKGStore:
         stmts = [
             "CREATE CONSTRAINT kg_graph_id_unique IF NOT EXISTS FOR (g:KGGraph) REQUIRE g.graph_id IS UNIQUE",
             "CREATE CONSTRAINT kg_entity_uuid_unique IF NOT EXISTS FOR (e:KGEntity) REQUIRE e.uuid IS UNIQUE",
+            "CREATE CONSTRAINT kg_chunk_unique IF NOT EXISTS FOR (c:KGChunk) REQUIRE (c.chunk_id, c.graph_id) IS UNIQUE",
             "CREATE INDEX kg_entity_graph_id IF NOT EXISTS FOR (e:KGEntity) ON (e.graph_id)",
             "CREATE INDEX kg_rel_graph_id IF NOT EXISTS FOR ()-[r:KG_REL]-() ON (r.graph_id)",
             "CREATE INDEX kg_chunk_graph_id IF NOT EXISTS FOR (c:KGChunk) ON (c.graph_id)",
             "CREATE INDEX kg_chunk_chunk_id IF NOT EXISTS FOR (c:KGChunk) ON (c.chunk_id)",
+            "CREATE INDEX kg_chunk_kb_chunk_id IF NOT EXISTS FOR (c:KGChunk) ON (c.kb_chunk_id)",
         ]
         with self._driver.session(database=self._database) as session:
             for c in stmts:
@@ -157,12 +162,18 @@ class Neo4jKGStore:
         return uuids
 
     def upsert_chunk(self, chunk: KGChunk) -> None:
+        preview = (chunk.text_preview or "").strip()
+        # Keep Neo4j lean: store only a short preview; fetch full text from KB by kb_chunk_id when needed.
+        if len(preview) > 480:
+            preview = preview[:480] + "…"
         with self._driver.session(database=self._database) as session:
             session.run(
                 """
-                MERGE (c:KGChunk {chunk_id:$chunk_id})
-                SET c.graph_id=$graph_id,
-                    c.text=$text,
+                MERGE (c:KGChunk {chunk_id:$chunk_id, graph_id:$graph_id})
+                SET c.text_preview=$text_preview,
+                    c.kb_doc_id=$kb_doc_id,
+                    c.kb_chunk_id=$kb_chunk_id,
+                    c.source=$source,
                     c.created_at=COALESCE(c.created_at,$created_at)
                 WITH c
                 MATCH (g:KGGraph {graph_id:$graph_id})
@@ -170,7 +181,10 @@ class Neo4jKGStore:
                 """,
                 chunk_id=chunk.chunk_id,
                 graph_id=chunk.graph_id,
-                text=chunk.text,
+                text_preview=preview,
+                kb_doc_id=(chunk.kb_doc_id or "").strip(),
+                kb_chunk_id=(chunk.kb_chunk_id or "").strip(),
+                source=(chunk.source or "").strip(),
                 created_at=chunk.created_at or _now_iso(),
             )
 
@@ -196,7 +210,12 @@ class Neo4jKGStore:
             rows = session.run(
                 """
                 MATCH (c:KGChunk {graph_id:$graph_id})-[:MENTIONS]->(e:KGEntity {uuid:$uuid, graph_id:$graph_id})
-                RETURN c.chunk_id AS chunk_id, c.text AS text, c.created_at AS created_at
+                RETURN c.chunk_id AS chunk_id,
+                       COALESCE(c.text_preview, '') AS text_preview,
+                       COALESCE(c.kb_doc_id, '') AS kb_doc_id,
+                       COALESCE(c.kb_chunk_id, '') AS kb_chunk_id,
+                       COALESCE(c.source, '') AS source,
+                       c.created_at AS created_at
                 ORDER BY c.created_at DESC
                 LIMIT $limit
                 """,
@@ -206,7 +225,16 @@ class Neo4jKGStore:
             )
             out = []
             for r in rows:
-                out.append({"chunk_id": r["chunk_id"], "text": r["text"], "created_at": r["created_at"]})
+                out.append(
+                    {
+                        "chunk_id": r["chunk_id"],
+                        "text_preview": r["text_preview"],
+                        "kb_doc_id": r["kb_doc_id"],
+                        "kb_chunk_id": r["kb_chunk_id"],
+                        "source": r["source"],
+                        "created_at": r["created_at"],
+                    }
+                )
             return out
 
     def set_entity_interpretation(

@@ -19,6 +19,7 @@ function emptyAgent() {
 
 export default function AgentsModal({ open, onClose, onChanged }) {
   const [agents, setAgents] = useState([]);
+  const [status, setStatus] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const [kbDocs, setKbDocs] = useState([]);
@@ -40,12 +41,68 @@ export default function AgentsModal({ open, onClose, onChanged }) {
     return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
   }, [kbDocs]);
 
+  const modelOptions = useMemo(() => {
+    const common = [
+      { spec: 'dashscope:qwen-turbo', label: 'DashScope · qwen-turbo（更快）' },
+      { spec: 'dashscope:qwen-plus', label: 'DashScope · qwen-plus' },
+      { spec: 'dashscope:qwen-max', label: 'DashScope · qwen-max（更强）' },
+      { spec: 'ollama:llama3.1', label: 'Ollama · llama3.1（本地）' },
+    ];
+
+    const fromStatus = [];
+    const seen = new Set();
+    const push = (spec) => {
+      const s = String(spec || '').trim();
+      if (!s || seen.has(s)) return;
+      seen.add(s);
+      const [provider, ...rest] = s.split(':');
+      const model = rest.join(':') || '';
+      fromStatus.push({ spec: s, label: `${provider} · ${model || s}` });
+    };
+
+    try {
+      push(status?.chairman_model?.spec);
+      push(status?.title_model?.spec);
+      for (const m of status?.council_models || []) push(m?.spec);
+    } catch {
+      // ignore
+    }
+    try {
+      for (const a of agents || []) push(a?.model_spec);
+    } catch {
+      // ignore
+    }
+
+    const uniqueCommon = [];
+    for (const it of common) {
+      const s = String(it.spec || '').trim();
+      if (!s || seen.has(s)) continue;
+      uniqueCommon.push(it);
+      seen.add(s);
+    }
+
+    return { common: uniqueCommon, detected: fromStatus };
+  }, [status, agents]);
+
+  const modelSelectValue = useMemo(() => {
+    const current = String(draft.model_spec || '').trim();
+    if (!current) return '';
+    const all = [...(modelOptions.common || []), ...(modelOptions.detected || [])];
+    return all.some((o) => o?.spec === current) ? current : '';
+  }, [draft.model_spec, modelOptions]);
+
   async function reload() {
     setIsLoading(true);
     setError('');
     try {
-      const [items, docs, graphsRes] = await Promise.all([api.listAgents(), api.listKBDocuments(), api.listKGGraphs().catch((e) => ({ __error: e }))]);
+      const [items, docs, graphsRes, s] = await Promise.all([
+        api.listAgents(),
+        api.listKBDocuments(),
+        api.listKGGraphs().catch((e) => ({ __error: e })),
+        api.getStatus().catch((e) => ({ __error: e })),
+      ]);
       setAgents(items);
+      setStatus(s && !s.__error ? s : null);
       setKbDocs(docs?.documents || []);
       if (graphsRes && graphsRes.__error) {
         setKgGraphs([]);
@@ -137,7 +194,7 @@ export default function AgentsModal({ open, onClose, onChanged }) {
     }
     setIsGeneratingPersona(true);
     try {
-      const res = await api.generateAgentPersona({ name });
+      const res = await api.generateAgentPersona({ name, model_spec: (draft.model_spec || '').trim() || null });
       const persona = res?.persona || '';
       if (!persona.trim()) {
         setError('生成人设失败：未返回内容');
@@ -228,11 +285,43 @@ export default function AgentsModal({ open, onClose, onChanged }) {
 
               <label className="field">
                 <div className="label">model_spec</div>
+                <select
+                  className="select"
+                  value={modelSelectValue}
+                  onChange={(e) => {
+                    const v = String(e.target.value || '').trim();
+                    if (!v) return;
+                    setDraft((p) => ({ ...p, model_spec: v }));
+                  }}
+                >
+                  <option value="">（下拉选择模型，或手动输入）</option>
+                  {modelOptions.common?.length ? (
+                    <optgroup label="常用">
+                      {modelOptions.common.map((o) => (
+                        <option key={`common:${o.spec}`} value={o.spec}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                  {modelOptions.detected?.length ? (
+                    <optgroup label="当前系统检测到">
+                      {modelOptions.detected.map((o) => (
+                        <option key={`detected:${o.spec}`} value={o.spec}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ) : null}
+                </select>
                 <input
                   value={draft.model_spec}
                   onChange={(e) => setDraft((p) => ({ ...p, model_spec: e.target.value }))}
                   placeholder="例如：dashscope:qwen-plus / ollama:llama3.1"
                 />
+                <div className="hint" style={{ marginTop: 6 }}>
+                  格式：`provider:model`。下拉选择会自动填充到 `model_spec`，也可以直接手动修改。
+                </div>
               </label>
 
               <label className="field inline">

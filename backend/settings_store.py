@@ -30,13 +30,16 @@ class Settings:
     enable_agent_web_search: bool = False
     agent_web_search_results: int = 3
 
+    # Agent auto tool calls (opt-in): agents may request background tools via a tool block.
+    enable_agent_auto_tools: bool = False
+
     # Knowledge base retrieval
     # fts | semantic | hybrid
     kb_retrieval_mode: str = "hybrid"
     kb_embedding_model: str = field(default_factory=lambda: config.KB_EMBEDDING_MODEL or "")
     kb_enable_rerank: bool = True
     kb_rerank_model: str = field(default_factory=lambda: config.KB_RERANK_MODEL or "")
-    kb_semantic_pool: int = 2000
+    kb_semantic_pool: int = 400
     kb_initial_k: int = 24
 
     # Knowledge base continuous ingestion (watch folders + incremental import)
@@ -73,6 +76,42 @@ class Settings:
     enable_history_context: bool = True
     history_max_messages: int = 12
 
+    # Job runner (VCP-like long tasks)
+    # Per-tool concurrency limits (job_type -> max concurrent runs)
+    job_tool_limits: Dict[str, int] = field(
+        default_factory=lambda: {
+            "kg_extract": 1,
+            "kb_index": 1,
+            "office_ingest": 1,
+            "web_search": 2,
+            "evidence_pack": 2,
+            "paper_search": 2,
+        }
+    )
+    # Per-tool default timeout seconds (job_type -> seconds). Payload can override with timeout_seconds.
+    job_default_timeouts: Dict[str, int] = field(
+        default_factory=lambda: {
+            "kg_extract": 60 * 30,
+            "kb_index": 60 * 20,
+            "office_ingest": 60 * 10,
+            "web_search": 60 * 5,
+            "evidence_pack": 60 * 8,
+            "paper_search": 60 * 5,
+        }
+    )
+    # Per-tool "successful result reuse" TTL (seconds). If >0 and an idempotent job succeeded recently,
+    # new create requests will reuse the existing result instead of re-running.
+    job_result_ttls: Dict[str, int] = field(
+        default_factory=lambda: {
+            "web_search": 300,
+            "evidence_pack": 600,
+            "kb_index": 0,
+            "kg_extract": 0,
+            "office_ingest": 0,
+            "paper_search": 300,
+        }
+    )
+
     updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
 
@@ -83,7 +122,8 @@ def _ensure_dir():
 def _load_raw() -> Dict[str, Any]:
     if not SETTINGS_FILE.exists():
         return {}
-    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+    # Be tolerant of UTF-8 BOM (common when edited by some Windows tools).
+    with open(SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
@@ -105,11 +145,12 @@ def get_settings() -> Settings:
         web_search_results=int(data.get("web_search_results", 5)),
         enable_agent_web_search=bool(data.get("enable_agent_web_search", False)),
         agent_web_search_results=max(0, min(10, int(data.get("agent_web_search_results", 3)))),
+        enable_agent_auto_tools=bool(data.get("enable_agent_auto_tools", False)),
         kb_retrieval_mode=str(data.get("kb_retrieval_mode", "hybrid") or "hybrid").lower(),
         kb_embedding_model=str(data.get("kb_embedding_model", "") or ""),
         kb_enable_rerank=bool(data.get("kb_enable_rerank", True)),
         kb_rerank_model=str(data.get("kb_rerank_model", "") or ""),
-        kb_semantic_pool=int(data.get("kb_semantic_pool", 2000)),
+        kb_semantic_pool=int(data.get("kb_semantic_pool", 400)),
         kb_initial_k=int(data.get("kb_initial_k", 24)),
         kb_watch_enable=bool(data.get("kb_watch_enable", bool(config.KB_WATCH_ENABLE))),
         kb_watch_roots=list(data.get("kb_watch_roots", list(config.KB_WATCH_ROOTS or [])) or []),
@@ -128,6 +169,11 @@ def get_settings() -> Settings:
         report_kb_category=str(data.get("report_kb_category", "council_reports") or "council_reports"),
         enable_history_context=bool(data.get("enable_history_context", True)),
         history_max_messages=max(0, min(50, int(data.get("history_max_messages", 12)))),
+        job_tool_limits=dict(data.get("job_tool_limits", Settings().job_tool_limits) or Settings().job_tool_limits),
+        job_default_timeouts=dict(
+            data.get("job_default_timeouts", Settings().job_default_timeouts) or Settings().job_default_timeouts
+        ),
+        job_result_ttls=dict(data.get("job_result_ttls", Settings().job_result_ttls) or Settings().job_result_ttls),
         updated_at=data.get("updated_at") or datetime.utcnow().isoformat(),
     )
     # Env defaults (allow settings.json to omit/leave empty for these).
@@ -162,6 +208,9 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
 
     if "agent_web_search_results" in patch:
         s.agent_web_search_results = max(0, min(10, int(patch["agent_web_search_results"])))
+
+    if "enable_agent_auto_tools" in patch:
+        s.enable_agent_auto_tools = bool(patch["enable_agent_auto_tools"])
 
     if "kb_retrieval_mode" in patch:
         val = str(patch["kb_retrieval_mode"] or "").strip().lower()
@@ -249,6 +298,51 @@ def update_settings(patch: Dict[str, Any]) -> Settings:
 
     if "history_max_messages" in patch:
         s.history_max_messages = max(0, min(50, int(patch["history_max_messages"])))
+
+    if "job_tool_limits" in patch:
+        val = patch.get("job_tool_limits") or {}
+        if isinstance(val, dict):
+            cleaned: Dict[str, int] = {}
+            for k, v in val.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                try:
+                    cleaned[key] = max(1, min(32, int(v)))
+                except Exception:
+                    continue
+            if cleaned:
+                s.job_tool_limits = cleaned
+
+    if "job_default_timeouts" in patch:
+        val = patch.get("job_default_timeouts") or {}
+        if isinstance(val, dict):
+            cleaned: Dict[str, int] = {}
+            for k, v in val.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                try:
+                    cleaned[key] = max(1, min(24 * 60 * 60, int(v)))
+                except Exception:
+                    continue
+            if cleaned:
+                s.job_default_timeouts = cleaned
+
+    if "job_result_ttls" in patch:
+        val = patch.get("job_result_ttls") or {}
+        if isinstance(val, dict):
+            cleaned: Dict[str, int] = {}
+            for k, v in val.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                try:
+                    cleaned[key] = max(0, min(24 * 60 * 60, int(v)))
+                except Exception:
+                    continue
+            if cleaned:
+                s.job_result_ttls = cleaned
 
     s.updated_at = datetime.utcnow().isoformat()
     # Fill defaults from env if not set explicitly

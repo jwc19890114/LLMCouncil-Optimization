@@ -5,12 +5,14 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .. import storage, settings_store
+from .. import projects_store
 from ..jobs_store import Job
 from ..office_extract import extract_office_text
 from ..tool_context import ToolContext
 
 
 async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
+    ctx.check_job_cancelled(job.id)
     payload = job.payload or {}
     path_raw = str(payload.get("path") or "").strip()
     if not path_raw:
@@ -67,6 +69,12 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
                 existing = conv.get("kb_doc_ids") or []
                 merged = list(existing) + [doc_id]
                 storage.update_conversation_kb_doc_ids(conversation_id, merged)
+                project_id = str(conv.get("project_id") or "").strip()
+                if project_id:
+                    try:
+                        projects_store.add_project_kb_doc_id(project_id, doc_id)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -76,11 +84,13 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
     should_index = bool(payload.get("index_embeddings", False)) and bool(model) and write_kb
     embeddings = None
     if should_index:
+        ctx.check_job_cancelled(job.id)
         try:
             embeddings = await ctx.kb_retriever.index_embeddings(
                 embedding_model_spec=model,
                 doc_ids=[doc_id],
-                pool=max(int(settings.kb_semantic_pool or 2000) * 10, 5000),
+                pool=max(int(settings.kb_semantic_pool or 400) * 10, 5000),
+                check_cancelled=lambda: ctx.check_job_cancelled(job.id),
             )
         except Exception:
             embeddings = None
@@ -97,4 +107,3 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
         "embeddings": embeddings,
         "conversation_id": conversation_id,
     }
-

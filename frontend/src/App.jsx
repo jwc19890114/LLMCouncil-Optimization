@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import AgentsModal from './components/AgentsModal';
@@ -10,11 +10,17 @@ import PluginsPage from './components/PluginsPage';
 import { api } from './api';
 import './App.css';
 
+const API_BASE =
+  import.meta.env.VITE_API_BASE ||
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8001');
+
 function App() {
   const [conversations, setConversations] = useState([]);
+  const [projects, setProjects] = useState([]);
   const [currentConversationId, setCurrentConversationId] = useState(null);
   const [currentConversation, setCurrentConversation] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const streamAbortRef = useRef(null);
   const [status, setStatus] = useState(null);
   const [isAgentsOpen, setIsAgentsOpen] = useState(false);
   const [isConversationAgentsOpen, setIsConversationAgentsOpen] = useState(false);
@@ -39,6 +45,15 @@ function App() {
     }
   }
 
+  async function loadProjects() {
+    try {
+      const ps = await api.listProjects();
+      setProjects(ps);
+    } catch (error) {
+      console.error('Failed to load projects:', error);
+    }
+  }
+
   // Load conversations on mount
   useEffect(() => {
     let cancelled = false;
@@ -59,6 +74,15 @@ function App() {
       })
       .catch((error) => {
         console.error('Failed to load status:', error);
+      });
+
+    api
+      .listProjects()
+      .then((ps) => {
+        if (!cancelled) setProjects(ps);
+      })
+      .catch((error) => {
+        console.error('Failed to load projects:', error);
       });
 
     return () => {
@@ -85,6 +109,54 @@ function App() {
       cancelled = true;
     };
   }, [currentConversationId]);
+
+  // Stream job updates (no WebSocket): append chat-visible job messages into current conversation.
+  useEffect(() => {
+    if (!currentConversationId) return;
+    if (activeView !== 'chat') return;
+
+    const url = `${API_BASE}/api/conversations/${encodeURIComponent(currentConversationId)}/jobs/stream`;
+    const es = new EventSource(url);
+
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev?.data || '{}');
+        const msg = payload?.message;
+        const meta = msg?.metadata;
+        if (!msg || meta?.type !== 'job_event') return;
+
+        setCurrentConversation((prev) => {
+          if (!prev || prev.id !== currentConversationId) return prev;
+          const messages = Array.isArray(prev.messages) ? [...prev.messages] : [];
+          const jobId = String(meta.job_id || '').trim();
+          const status = String(meta.status || '').trim();
+          if (jobId) {
+            const exists = messages
+              .slice(-80)
+              .some(
+                (m) =>
+                  m?.metadata?.type === 'job_event' &&
+                  String(m?.metadata?.job_id || '').trim() === jobId &&
+                  String(m?.metadata?.status || '').trim() === status
+              );
+            if (exists) return prev;
+          }
+          messages.push(msg);
+          return { ...prev, messages };
+        });
+      } catch (e) {
+        // ignore parse errors
+      }
+    };
+
+    return () => {
+      try {
+        es.close();
+      } catch {
+        // ignore
+      }
+    };
+  }, [currentConversationId, activeView]);
 
   const handleNewConversation = async () => {
     try {
@@ -145,6 +217,16 @@ function App() {
   const handleSendMessage = async (content) => {
     if (!currentConversationId) return;
 
+    // Interrupt previous in-flight stream if any.
+    try {
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+        streamAbortRef.current = null;
+      }
+    } catch {
+      // ignore
+    }
+
     setIsLoading(true);
     try {
       // Optimistically add user message to UI
@@ -183,7 +265,12 @@ function App() {
       }));
 
         // Send message with streaming
-        await api.sendMessageStream(currentConversationId, content, (eventType, event) => {
+        const controller = new AbortController();
+        streamAbortRef.current = controller;
+        await api.sendMessageStream(
+          currentConversationId,
+          content,
+          (eventType, event) => {
           switch (eventType) {
             case 'stage0_start':
               setCurrentConversation((prev) => {
@@ -191,7 +278,9 @@ function App() {
                 const lastMsg = messages[messages.length - 1];
                 lastMsg.loading.stage0 = true;
                 return { ...prev, messages };
-              });
+          },
+          { signal: controller.signal }
+        );
               break;
 
             case 'stage0_complete':
@@ -248,7 +337,29 @@ function App() {
                 const messages = [...prev.messages];
                 const lastMsg = messages[messages.length - 1];
                 lastMsg.loading.stage2b = true;
+                lastMsg.stage2b = [];
                 lastMsg.metadata = { ...(lastMsg.metadata || {}), discussion_mode: event.mode || '' };
+                return { ...prev, messages };
+              });
+              break;
+
+            case 'stage2b_message':
+              setCurrentConversation((prev) => {
+                const messages = [...prev.messages];
+                const lastMsg = messages[messages.length - 1];
+                const arr = Array.isArray(lastMsg.stage2b) ? [...lastMsg.stage2b] : [];
+                if (event?.data) {
+                  const incoming = event.data;
+                  const last = arr.length ? arr[arr.length - 1] : null;
+                  const sameAsLast =
+                    last &&
+                    String(last.agent_id || '') === String(incoming.agent_id || '') &&
+                    String(last.agent_name || '') === String(incoming.agent_name || '') &&
+                    String(last.message || '') === String(incoming.message || '');
+                  if (!sameAsLast) arr.push(incoming);
+                }
+                lastMsg.stage2b = arr;
+                lastMsg.metadata = { ...(lastMsg.metadata || {}), discussion_mode: event.mode || (lastMsg.metadata || {}).discussion_mode || '' };
                 return { ...prev, messages };
               });
               break;
@@ -322,7 +433,21 @@ function App() {
               break;
 
           case 'title_complete':
-            // Reload conversations to get updated title
+            // Update current title immediately + refresh sidebar list.
+            setCurrentConversation((prev) => {
+              if (!prev) return prev;
+              const t = event?.data?.title;
+              if (!t) return prev;
+              return { ...prev, title: t };
+            });
+            setConversations((prev) => {
+              const t = event?.data?.title;
+              if (!t) return prev;
+              const id = currentConversationId;
+              return Array.isArray(prev)
+                ? prev.map((c) => (c?.id === id ? { ...c, title: t } : c))
+                : prev;
+            });
             loadConversations();
             break;
 
@@ -343,6 +468,10 @@ function App() {
         }
       });
     } catch (error) {
+      if (error?.name === 'AbortError') {
+        setIsLoading(false);
+        return;
+      }
       console.error('Failed to send message:', error);
       // Remove optimistic messages on error
       setCurrentConversation((prev) => ({
@@ -350,6 +479,64 @@ function App() {
         messages: prev.messages.slice(0, -2),
       }));
       setIsLoading(false);
+    } finally {
+      streamAbortRef.current = null;
+    }
+  };
+
+  const handleInterrupt = () => {
+    try {
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+        streamAbortRef.current = null;
+      }
+    } catch {
+      // ignore
+    }
+    setIsLoading(false);
+  };
+
+  const handleCreateProject = async (name) => {
+    const n = String(name || '').trim();
+    if (!n) return;
+    try {
+      await api.createProject({ name: n });
+      await loadProjects();
+    } catch (err) {
+      console.error('Failed to create project:', err);
+      alert(String(err?.message || err));
+    }
+  };
+
+  const handleSetConversationArchived = async (conversationId, archived) => {
+    const cid = String(conversationId || '').trim();
+    if (!cid) return;
+    try {
+      await api.setConversationArchived(cid, !!archived);
+      await loadConversations();
+      if (currentConversationId === cid) {
+        const c = await api.getConversation(cid);
+        setCurrentConversation(c);
+      }
+    } catch (err) {
+      console.error('Failed to update archive status:', err);
+      alert(String(err?.message || err));
+    }
+  };
+
+  const handleSetConversationProject = async (conversationId, projectId) => {
+    const cid = String(conversationId || '').trim();
+    if (!cid) return;
+    try {
+      await api.setConversationProject(cid, projectId || '');
+      await loadConversations();
+      if (currentConversationId === cid) {
+        const c = await api.getConversation(cid);
+        setCurrentConversation(c);
+      }
+    } catch (err) {
+      console.error('Failed to set conversation project:', err);
+      alert(String(err?.message || err));
     }
   };
 
@@ -357,6 +544,7 @@ function App() {
     <div className="app">
       <Sidebar
         conversations={conversations}
+        projects={projects}
         status={status}
         currentConversationId={currentConversationId}
         currentConversation={currentConversation}
@@ -364,6 +552,9 @@ function App() {
         onNewConversation={handleNewConversation}
         onDeleteConversation={handleDeleteConversation}
         onExportConversation={handleExportConversation}
+        onCreateProject={handleCreateProject}
+        onSetConversationArchived={handleSetConversationArchived}
+        onSetConversationProject={handleSetConversationProject}
         onManageAgents={() => setIsAgentsOpen(true)}
         onManageSettings={() => setIsSettingsOpen(true)}
         onManagePlugins={() => setActiveView('plugins')}
@@ -396,6 +587,7 @@ function App() {
         <ChatInterface
           conversation={currentConversation}
           onSendMessage={handleSendMessage}
+          onInterrupt={handleInterrupt}
           isLoading={isLoading}
           onExportConversation={() =>
             currentConversationId ? handleExportConversation(currentConversationId) : null

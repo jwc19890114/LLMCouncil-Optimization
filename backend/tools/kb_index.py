@@ -8,6 +8,7 @@ from ..tool_context import ToolContext
 
 
 async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
+    ctx.check_job_cancelled(job.id)
     payload = job.payload or {}
     settings = settings_store.get_settings()
     model = str(payload.get("embedding_model") or settings.kb_embedding_model or "").strip()
@@ -21,6 +22,7 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
         doc_ids=payload.get("doc_ids"),
         categories=payload.get("categories"),
         pool=int(payload.get("pool") or 5000),
+        check_cancelled=lambda: ctx.check_job_cancelled(job.id),
     )
     update_progress(1.0)
     return {
@@ -28,4 +30,3 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
         "summary": f"知识库 embedding 已完成：indexed={out.get('indexed',0)} / total={out.get('total',0)}（model={model}）",
         "data": out,
     }
-

@@ -14,6 +14,7 @@ from .kb_retrieval import KBHybridRetriever
 from .llm_client import parse_model_spec, provider_key_configured, query_model
 from .settings_store import get_settings
 from .storage import get_conversation
+from . import projects_store
 from .trace_store import append as trace_append
 from .web_search import ddg_search
 from .neo4j_store import Neo4jKGStore
@@ -34,6 +35,31 @@ def _extract_json_object(text: str) -> Dict[str, Any] | None:
 
 _agent_web_search_sem = asyncio.Semaphore(3)
 
+_TOOL_BLOCK_RE = re.compile(r"```tool\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def _extract_tool_blocks(text: str) -> tuple[str, list[dict]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return "", []
+
+    tool_requests: list[dict] = []
+    for m in _TOOL_BLOCK_RE.finditer(raw):
+        body = (m.group(1) or "").strip()
+        if not body:
+            continue
+        obj: Any = None
+        try:
+            obj = json.loads(body)
+        except Exception:
+            obj = _extract_json_object(body)
+        if isinstance(obj, dict):
+            tool_requests.append(obj)
+
+    clean = _TOOL_BLOCK_RE.sub("", raw)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, tool_requests
+
 
 def _agent_vote_weight(agent: AgentConfig) -> float:
     influence = float(agent.influence_weight)
@@ -51,6 +77,16 @@ def _agent_system_messages(agent: AgentConfig) -> List[Dict[str, str]]:
         parts.append("输出要求：全程使用简体中文回答。除非用户明确要求，否则不要输出英文。")
     elif settings.output_language == "en":
         parts.append("Output requirement: respond in English.")
+
+    if settings.enable_agent_auto_tools:
+        parts.append(
+            "如你判断需要调用后台工具，请在回答末尾追加一个 tool 代码块（会自动执行并回填结果到任务列表）。\n"
+            "示例：\n"
+            "```tool\n"
+            '{"tool":"paper_search","query":"文化 基因 解码","sources":["cnki","arxiv"],"max_results":10}\n'
+            "```\n"
+            "要求：只在确有必要时使用；query 要具体；sources 可选 arxiv/scholar/cnki；max_results 1-20。"
+        )
 
     if not parts:
         return []
@@ -122,6 +158,12 @@ def _get_conversation_kb_doc_ids(conversation_id: str | None) -> List[str]:
     if not isinstance(conv, dict):
         return []
     ids = conv.get("kb_doc_ids") or []
+    project_id = str(conv.get("project_id") or "").strip()
+    if project_id:
+        project = projects_store.get_project(project_id) or {}
+        proj_ids = project.get("kb_doc_ids") if isinstance(project, dict) else []
+        if isinstance(proj_ids, list) and proj_ids:
+            ids = list(ids) + list(proj_ids)
     if not isinstance(ids, list):
         return []
     out: List[str] = []
@@ -617,9 +659,12 @@ async def stage1_collect_responses(
 
     results = await asyncio.gather(*[run_one(a) for a in agents])
     stage1_results: List[Dict[str, Any]] = []
+    settings = get_settings()
     for agent, resp in results:
         if resp is None:
             continue
+        raw_text = resp.get("content", "") if isinstance(resp, dict) else ""
+        clean_text, tool_requests = _extract_tool_blocks(raw_text)
         stage1_results.append(
             {
                 "agent_id": agent.id,
@@ -627,7 +672,8 @@ async def stage1_collect_responses(
                 "model": agent.model_spec,
                 "influence_weight": agent.influence_weight,
                 "seniority_years": agent.seniority_years,
-                "response": resp.get("content", "") if isinstance(resp, dict) else "",
+                "response": clean_text,
+                "tool_requests": tool_requests if settings.enable_agent_auto_tools else [],
             }
         )
 
@@ -862,6 +908,86 @@ def _lively_message_brief(name: str, message: str, *, max_chars: int = 220) -> s
     return f"[{n}] {t}"
 
 
+def _user_requested_length_constraint(user_query: str) -> bool:
+    """
+    Best-effort: detect whether user explicitly requested a length/word-count constraint.
+    If so, we avoid applying the default per-message cap.
+    """
+    t = str(user_query or "").lower()
+    keys = [
+        "字数",
+        "不少于",
+        "不低于",
+        "至少",
+        "不超过",
+        "最多",
+        "以上",
+        "以下",
+        "words",
+        "word count",
+        "characters",
+        "char count",
+        ">= ",
+        "<= ",
+    ]
+    return any(k in t for k in keys)
+
+
+def _truncate_message_chars(text: str, *, max_chars: int) -> str:
+    t = str(text or "").strip()
+    if max_chars <= 0:
+        return t
+    if len(t) <= max_chars:
+        return t
+    return t[:max_chars].rstrip() + "…（已截断）"
+
+
+async def _rewrite_with_char_cap(
+    *,
+    conversation_id: str,
+    agent: AgentConfig,
+    topic: str,
+    original: str,
+    max_chars: int,
+    timeout: float = 35.0,
+) -> str:
+    """
+    Best-effort: when a response exceeds the per-message char cap, ask the same agent
+    to rewrite it within the cap while preserving key information.
+    """
+    original = str(original or "").strip()
+    if not original:
+        return ""
+
+    system = (
+        "你是对话内容编辑。\n"
+        f"任务：把下方内容改写为单条消息，字数不超过 {int(max_chars)} 字。\n"
+        "要求：\n"
+        "- 保留关键结论、证据点、可执行建议（如有）；不引入新信息。\n"
+        "- 逻辑清晰，像经过思考后的群聊接话，不要长篇大论。\n"
+        "- 不要使用 Markdown 标题；不要分点过多（最多 3 条）。\n"
+        "- 只输出改写后的消息正文。\n"
+    )
+    user = f"主题：{topic}\n\n原文：\n{original}\n\n请改写："
+    try:
+        resp = await _query_agent(
+            conversation_id=conversation_id,
+            stage="lively_rewrite_short",
+            agent=agent,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            timeout=timeout,
+        )
+        out = str((resp or {}).get("content") or "").strip()
+        if out and len(out) <= max_chars:
+            return out
+        if out:
+            return _truncate_message_chars(out, max_chars=max_chars)
+    except Exception:
+        pass
+
+    return _truncate_message_chars(original, max_chars=max_chars)
+
+
 def _pick_default_leaders(agents: List[AgentConfig], *, k: int) -> List[str]:
     k = max(1, min(int(k), len(agents)))
     return [a.id for a in agents[:k]]
@@ -1022,6 +1148,7 @@ async def stage2b_lively(
     initial_script: str,
     max_messages: int,
     max_turns: int,
+    emit: Any = None,
 ) -> Dict[str, Any]:
     """
     Free-flow multi-agent chat transcript with chairman checkpoints.
@@ -1083,6 +1210,8 @@ async def stage2b_lively(
 
     context_text = await _build_realtime_context(uq, conversation_id)
     knowledge_cache: Dict[str, str] = {}
+    enforce_cap = not _user_requested_length_constraint(uq)
+    per_message_cap = 300
 
     async def _get_knowledge(a: AgentConfig) -> str:
         if a.id in knowledge_cache:
@@ -1092,6 +1221,14 @@ async def stage2b_lively(
         return knowledge_cache[a.id]
 
     by_id: Dict[str, AgentConfig] = {a.id: a for a in agents}
+
+    def _emit_message(m: Dict[str, Any]) -> None:
+        if not emit:
+            return
+        try:
+            emit(m)
+        except Exception:
+            pass
 
     # Phase A: warmup collision (each agent 1 message)
     for agent in agents:
@@ -1104,7 +1241,11 @@ async def stage2b_lively(
         messages.append(
             {
                 "role": "system",
-                "content": "热身碰撞：你只发 1 条消息（<=120字）。给出你最有价值的观点/问题/建议，避免复读。",
+                "content": (
+                    "热身碰撞：你只发 1 条消息。给出你最有价值的观点/问题/建议，避免复读。\n"
+                    + ("字数要求：单条<=300字。\n" if enforce_cap else "")
+                    + "要求：逻辑清晰，像真实群聊接话，不要长篇大论。"
+                ),
             }
         )
         if context_text:
@@ -1123,7 +1264,16 @@ async def stage2b_lively(
         content = str((resp or {}).get("content") or "").strip()
         if not content:
             continue
+        if enforce_cap and len(content) > per_message_cap:
+            content = await _rewrite_with_char_cap(
+                conversation_id=conversation_id,
+                agent=agent,
+                topic=uq,
+                original=content,
+                max_chars=per_message_cap,
+            )
         transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+        _emit_message(transcript[-1])
 
     # Phase B: chairman picks variable #leaders + mainline/assignments
     leader_pick = await _chairman_pick_lively_leaders(
@@ -1160,6 +1310,7 @@ async def stage2b_lively(
                 "message": "\n".join(msg_lines),
             }
         )
+        _emit_message(transcript[-1])
 
     # Phase C: leaders speak first
     for lid in leader_ids:
@@ -1179,7 +1330,7 @@ async def stage2b_lively(
                 "content": (
                     "你是本轮意见领袖之一。请先抛出讨论框架/结论雏形，并点名提问 2~3 位其他专家，让他们基于你的框架补充/反驳。"
                     + (f"\n本轮主线：{mainline}" if mainline else "")
-                    + "\n要求：<=220字，必须可引发互动。"
+                    + "\n要求：<=300字，必须可引发互动。"
                 ),
             }
         )
@@ -1201,7 +1352,16 @@ async def stage2b_lively(
         content = str((resp or {}).get("content") or "").strip()
         if not content:
             continue
+        if enforce_cap and len(content) > per_message_cap:
+            content = await _rewrite_with_char_cap(
+                conversation_id=conversation_id,
+                agent=agent,
+                topic=uq,
+                original=content,
+                max_chars=per_message_cap,
+            )
         transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+        _emit_message(transcript[-1])
 
     # Phase D: everyone else responds (must add their own substance)
     def _assignment_for(aid: str) -> str:
@@ -1229,7 +1389,7 @@ async def stage2b_lively(
                     "禁止只有“同意/支持/赞同”之类的附和。"
                     + (f"\n你的分工任务：{task}" if task else "")
                     + (f"\n本轮主线：{mainline}" if mainline else "")
-                    + "\n要求：<=220字。"
+                    + "\n要求：<=300字。"
                 ),
             }
         )
@@ -1251,7 +1411,16 @@ async def stage2b_lively(
         content = str((resp or {}).get("content") or "").strip()
         if not content:
             continue
+        if enforce_cap and len(content) > per_message_cap:
+            content = await _rewrite_with_char_cap(
+                conversation_id=conversation_id,
+                agent=agent,
+                topic=uq,
+                original=content,
+                max_chars=per_message_cap,
+            )
         transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+        _emit_message(transcript[-1])
 
     # Free-flow rounds with chairman checkpoints
     checkpoint_every = max(4, min(10, len(agents) + 1))
@@ -1279,7 +1448,7 @@ async def stage2b_lively(
             _lively_script_rules(script),
             (f"本轮主线：{mainline}" if mainline else ""),
             (f"你的分工任务：{task}" if task else ""),
-            "继续像群聊一样接话上一位，补充新信息/新角度/新问题；避免复读与长篇大论（<=220字）。",
+            "继续像群聊一样接话上一位，补充新信息/新角度/新问题；避免复读与长篇大论（<=300字）。",
         ]
         if agent.id not in leader_ids:
             system_hints.append("如果你要表示赞同，必须同时补充证据/反例/替代方案/风险边界/步骤清单之一。")
@@ -1302,7 +1471,16 @@ async def stage2b_lively(
         )
         content = str((resp or {}).get("content") or "").strip()
         if content:
+            if enforce_cap and len(content) > per_message_cap:
+                content = await _rewrite_with_char_cap(
+                    conversation_id=conversation_id,
+                    agent=agent,
+                    topic=uq,
+                    original=content,
+                    max_chars=per_message_cap,
+                )
             transcript.append({"agent_id": agent.id, "agent_name": agent.name, "model": agent.model_spec, "message": content})
+            _emit_message(transcript[-1])
             since_checkpoint += 1
 
         if since_checkpoint >= checkpoint_every:
@@ -1364,6 +1542,7 @@ async def stage2b_lively(
                         "message": note,
                     }
                 )
+                _emit_message(transcript[-1])
 
             if action == "converge":
                 break

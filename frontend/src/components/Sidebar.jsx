@@ -19,12 +19,56 @@ function saveBool(key, value) {
   }
 }
 
+function loadStr(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return fallback;
+    return String(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function saveStr(key, value) {
+  try {
+    localStorage.setItem(key, String(value ?? ''));
+  } catch {
+    // ignore
+  }
+}
+
+function loadJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // ignore
+  }
+}
+
 function useCollapsible(key, defaultCollapsed) {
   const [collapsed, setCollapsed] = useState(() => loadBool(key, defaultCollapsed));
   useEffect(() => {
     saveBool(key, collapsed);
   }, [key, collapsed]);
   return [collapsed, setCollapsed];
+}
+
+function useStoredString(key, defaultValue) {
+  const [value, setValue] = useState(() => loadStr(key, defaultValue));
+  useEffect(() => {
+    saveStr(key, value);
+  }, [key, value]);
+  return [value, setValue];
 }
 
 function Section({ title, subtitle, collapsed, onToggle, grow, children, actions }) {
@@ -45,6 +89,7 @@ function Section({ title, subtitle, collapsed, onToggle, grow, children, actions
 
 export default function Sidebar({
   conversations,
+  projects,
   status,
   currentConversationId,
   currentConversation,
@@ -52,6 +97,9 @@ export default function Sidebar({
   onNewConversation,
   onDeleteConversation,
   onExportConversation,
+  onCreateProject,
+  onSetConversationArchived,
+  onSetConversationProject,
   activeView,
   onManageAgents,
   onManageKnowledgeBase,
@@ -81,6 +129,30 @@ export default function Sidebar({
   const [expertsCollapsed, setExpertsCollapsed] = useCollapsible('sidebar:expertsCollapsed', isSmallScreen);
   const [toolsCollapsed, setToolsCollapsed] = useCollapsible('sidebar:toolsCollapsed', isSmallScreen);
   const [convsCollapsed, setConvsCollapsed] = useCollapsible('sidebar:convsCollapsed', false);
+  const [showArchived, setShowArchived] = useCollapsible('sidebar:showArchived', false);
+  const [projectFilter, setProjectFilter] = useStoredString('sidebar:projectFilter', 'all'); // all | none | project_id
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [projectDraft, setProjectDraft] = useState('');
+  const [moveConvId, setMoveConvId] = useState('');
+  const [collapsedProjectGroups, setCollapsedProjectGroups] = useState(() => {
+    const arr = loadJson('sidebar:collapsedProjectGroups', []);
+    return new Set(Array.isArray(arr) ? arr.map((x) => String(x)) : []);
+  });
+
+  useEffect(() => {
+    saveJson('sidebar:collapsedProjectGroups', Array.from(collapsedProjectGroups));
+  }, [collapsedProjectGroups]);
+
+  const isGroupCollapsed = (groupKey) => collapsedProjectGroups.has(String(groupKey));
+  const toggleGroupCollapsed = (groupKey) => {
+    const key = String(groupKey);
+    setCollapsedProjectGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
 
   const expertsTitle = useMemo(() => {
     const total = enabledAgents.length;
@@ -94,6 +166,63 @@ export default function Sidebar({
 
   const toolsTitle = '功能栏';
   const convsTitle = `会话组（${conversations.length}）`;
+
+  const projectsList = Array.isArray(projects) ? projects : [];
+
+  const { visibleConversations, archivedConversations } = useMemo(() => {
+    const all = Array.isArray(conversations) ? conversations : [];
+    const active = all.filter((c) => !c?.archived);
+    const archived = all.filter((c) => !!c?.archived);
+    const normalize = (c) => ({
+      ...c,
+      archived: !!c?.archived,
+      project_id: String(c?.project_id || ''),
+    });
+    return { visibleConversations: active.map(normalize), archivedConversations: archived.map(normalize) };
+  }, [conversations]);
+
+  const groupedConversations = useMemo(() => {
+    const byProject = new Map();
+    for (const p of projectsList) {
+      if (!p?.id) continue;
+      byProject.set(String(p.id), { id: String(p.id), name: String(p.name || 'Project'), conversations: [] });
+    }
+    const noProject = { id: '', name: 'No Project', conversations: [] };
+
+    const pool =
+      projectFilter === 'all'
+        ? visibleConversations
+        : projectFilter === 'none'
+          ? visibleConversations.filter((c) => !c.project_id)
+          : visibleConversations.filter((c) => c.project_id === projectFilter);
+
+    for (const c of pool) {
+      const pid = String(c.project_id || '');
+      if (!pid) {
+        noProject.conversations.push(c);
+        continue;
+      }
+      const g = byProject.get(pid);
+      if (g) g.conversations.push(c);
+      else noProject.conversations.push({ ...c, project_id: '' });
+    }
+
+    const groups = [];
+    if (projectFilter === 'all') {
+      for (const g of Array.from(byProject.values()).sort((a, b) => a.name.localeCompare(b.name))) {
+        if (g.conversations.length) groups.push(g);
+      }
+      if (noProject.conversations.length) groups.push(noProject);
+      return groups;
+    }
+
+    if (projectFilter === 'none') {
+      return noProject.conversations.length ? [noProject] : [];
+    }
+
+    const g = byProject.get(projectFilter);
+    return g && g.conversations.length ? [g] : [];
+  }, [projectsList, visibleConversations, projectFilter]);
 
   return (
     <div className="sidebar">
@@ -153,48 +282,233 @@ export default function Sidebar({
           </button>
         }
       >
+        <div className="sidebar-conv-controls">
+          <select className="sidebar-select" value={projectFilter} onChange={(e) => setProjectFilter(e.target.value)}>
+            <option value="all">全部项目</option>
+            <option value="none">未归类</option>
+            {projectsList.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name || p.id}
+              </option>
+            ))}
+          </select>
+          <button
+            className="icon-btn"
+            type="button"
+            title="新建项目"
+            onClick={() => {
+              setCreatingProject((v) => !v);
+              setProjectDraft('');
+            }}
+          >
+            + 项目
+          </button>
+          <button className="icon-btn" type="button" title="归档" onClick={() => setShowArchived((v) => !v)}>
+            {showArchived ? '隐藏归档' : '归档'}
+          </button>
+        </div>
+
+        {creatingProject ? (
+          <div className="sidebar-project-create">
+            <input
+              className="sidebar-input"
+              value={projectDraft}
+              onChange={(e) => setProjectDraft(e.target.value)}
+              placeholder="项目名称"
+            />
+            <button
+              className="icon-btn"
+              type="button"
+              onClick={() => {
+                const name = String(projectDraft || '').trim();
+                if (!name) return;
+                onCreateProject?.(name);
+                setCreatingProject(false);
+                setProjectDraft('');
+              }}
+            >
+              创建
+            </button>
+            <button
+              className="icon-btn"
+              type="button"
+              onClick={() => {
+                setCreatingProject(false);
+                setProjectDraft('');
+              }}
+            >
+              取消
+            </button>
+          </div>
+        ) : null}
+
         <div className="conversation-list">
-          {conversations.length === 0 ? (
+          {visibleConversations.length === 0 ? (
             <div className="no-conversations">暂无会话</div>
           ) : (
-            conversations.map((conv) => (
-              <div
-                key={conv.id}
-                className={`conversation-item ${conv.id === currentConversationId ? 'active' : ''}`}
-                onClick={() => onSelectConversation(conv.id)}
-              >
-                <div className="conversation-row">
-                  <div className="conversation-main">
-                    <div className="conversation-title">{conv.title || 'New Conversation'}</div>
-                    <div className="conversation-meta">{conv.message_count} 条消息</div>
-                  </div>
-                  <div className="conversation-actions">
-                    <button
-                      className="icon-btn"
-                      title="导出"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onExportConversation?.(conv.id);
-                      }}
-                      type="button"
+            <>
+              {groupedConversations.map((group) => (
+                <div
+                  key={`group:${group.id || 'none'}`}
+                  className={`project-group ${isGroupCollapsed(`group:${group.id || 'none'}`) ? 'collapsed' : ''}`}
+                >
+                  <button
+                    className="project-group-header project-group-toggle"
+                    type="button"
+                    onClick={() => toggleGroupCollapsed(`group:${group.id || 'none'}`)}
+                    title="折叠/展开"
+                  >
+                    <span
+                      className={`project-chevron ${isGroupCollapsed(`group:${group.id || 'none'}`) ? 'collapsed' : ''}`}
                     >
-                      导出
-                    </button>
-                    <button
-                      className="icon-btn danger"
-                      title="删除"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDeleteConversation?.(conv.id);
-                      }}
-                      type="button"
+                      ▾
+                    </span>
+                    <span className="project-group-name">{group.name}</span>
+                    <span className="project-badge">{group.conversations.length}</span>
+                  </button>
+                  {isGroupCollapsed(`group:${group.id || 'none'}`)
+                    ? null
+                    : group.conversations.map((conv) => (
+                    <div
+                      key={conv.id}
+                      className={`conversation-item ${conv.id === currentConversationId ? 'active' : ''}`}
+                      onClick={() => onSelectConversation(conv.id)}
                     >
-                      删除
-                    </button>
-                  </div>
+                      <div className="conversation-row">
+                        <div className="conversation-main">
+                          <div className="conversation-title">{conv.title || 'New Conversation'}</div>
+                          <div className="conversation-meta">{conv.message_count} 条消息</div>
+                        </div>
+                        <div className="conversation-actions">
+                          <button
+                            className="icon-btn"
+                            title="移动"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setMoveConvId((prev) => (prev === conv.id ? '' : conv.id));
+                            }}
+                            type="button"
+                          >
+                            移动
+                          </button>
+                          <button
+                            className="icon-btn"
+                            title="归档"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSetConversationArchived?.(conv.id, true);
+                            }}
+                            type="button"
+                          >
+                            归档
+                          </button>
+                          <button
+                            className="icon-btn"
+                            title="导出"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onExportConversation?.(conv.id);
+                            }}
+                            type="button"
+                          >
+                            导出
+                          </button>
+                          <button
+                            className="icon-btn danger"
+                            title="删除"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onDeleteConversation?.(conv.id);
+                            }}
+                            type="button"
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+
+                      {moveConvId === conv.id ? (
+                        <div className="conversation-move">
+                          <select
+                            className="sidebar-select"
+                            value={conv.project_id || ''}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              onSetConversationProject?.(conv.id, v);
+                              setMoveConvId('');
+                            }}
+                          >
+                            <option value="">未归类</option>
+                            {projectsList.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name || p.id}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
                 </div>
-              </div>
-            ))
+              ))}
+
+              {showArchived ? (
+                <div className="project-group">
+                  <button
+                    className="project-group-header project-group-toggle"
+                    type="button"
+                    onClick={() => toggleGroupCollapsed('group:archived')}
+                    title="折叠/展开"
+                  >
+                    <span className={`project-chevron ${isGroupCollapsed('group:archived') ? 'collapsed' : ''}`}>
+                      ▾
+                    </span>
+                    <span className="project-group-name">归档</span>
+                    <span className="project-badge">{archivedConversations.length}</span>
+                  </button>
+                  {isGroupCollapsed('group:archived')
+                    ? null
+                    : archivedConversations.map((conv) => (
+                    <div
+                      key={conv.id}
+                      className={`conversation-item ${conv.id === currentConversationId ? 'active' : ''}`}
+                      onClick={() => onSelectConversation(conv.id)}
+                    >
+                      <div className="conversation-row">
+                        <div className="conversation-main">
+                          <div className="conversation-title">{conv.title || 'New Conversation'}</div>
+                          <div className="conversation-meta">{conv.message_count} 条消息</div>
+                        </div>
+                        <div className="conversation-actions">
+                          <button
+                            className="icon-btn"
+                            title="恢复"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSetConversationArchived?.(conv.id, false);
+                            }}
+                            type="button"
+                          >
+                            恢复
+                          </button>
+                          <button
+                            className="icon-btn danger"
+                            title="删除"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onDeleteConversation?.(conv.id);
+                            }}
+                            type="button"
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </>
           )}
         </div>
       </Section>

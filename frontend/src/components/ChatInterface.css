@@ -78,6 +78,18 @@
   padding: 12px;
 }
 
+.chat-modal.job-result-modal {
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.chat-modal.job-result-modal .chat-modal-body {
+  flex: 1;
+  overflow: auto;
+}
+
 .chat-modal-header {
   display: flex;
   align-items: center;
@@ -260,6 +272,57 @@
   margin-bottom: 6px;
 }
 
+.jobs-results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 62vh;
+  overflow: auto;
+  padding-right: 6px;
+}
+
+.jobs-result-item {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 10px;
+  background: #fff;
+}
+
+.jobs-result-title a {
+  color: #2563eb;
+  text-decoration: none;
+  font-weight: 800;
+}
+
+.jobs-result-title a:hover {
+  text-decoration: underline;
+}
+
+.jobs-result-meta {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 4px;
+}
+
+.jobs-result-authors {
+  font-size: 12px;
+  color: #475569;
+  margin-top: 6px;
+}
+
+.jobs-result-abstract {
+  font-size: 12px;
+  color: #334155;
+  margin-top: 6px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.jobs-result-abstract.collapsed {
+  max-height: 7.5em;
+  overflow: hidden;
+}
+
 .jobs-type {
   font-weight: 900;
   color: #0f172a;
@@ -280,6 +343,8 @@
   line-height: 1.5;
   margin-bottom: 8px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .messages-container {
@@ -336,6 +401,19 @@
   line-height: 1.6;
   max-width: 80%;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Backend events/direct messages can contain extremely long URLs; force wrapping */
+.stage2b-content {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.stage2b-content a {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .loading-indicator {

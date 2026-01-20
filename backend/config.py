@@ -5,7 +5,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / ".env")
+# Ensure .env values take effect even if the user has system-level env vars set.
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 # OpenRouter API key
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")

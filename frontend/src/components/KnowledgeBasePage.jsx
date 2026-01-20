@@ -42,6 +42,10 @@ export default function KnowledgeBasePage({ onBack }) {
   const [agents, setAgents] = useState([]);
   const [selectedAgentIds, setSelectedAgentIds] = useState(new Set());
   const [categories, setCategories] = useState([]);
+  const [docQuery, setDocQuery] = useState('');
+  const [docCategoryFilter, setDocCategoryFilter] = useState('');
+  const [docOnlyBound, setDocOnlyBound] = useState(false);
+  const [docSort, setDocSort] = useState('recent'); // recent | title
   const [batchItems, setBatchItems] = useState([]); // [{ filename, isMarkdown, title, source, text, size, file? }]
   const [selectedFile, setSelectedFile] = useState(null); // File for docx/xlsx
   const [filename, setFilename] = useState('');
@@ -73,6 +77,60 @@ export default function KnowledgeBasePage({ onBack }) {
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
   }, [docs]);
+
+  const formatDate = (iso) => {
+    const raw = String(iso || '').trim();
+    if (!raw) return '';
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return raw;
+    try {
+      return new Date(t).toLocaleString();
+    } catch {
+      return raw;
+    }
+  };
+
+  const shortId = (id, n = 10) => {
+    const s = String(id || '').trim();
+    if (!s) return '';
+    return s.length <= n ? s : `${s.slice(0, n)}…`;
+  };
+
+  const filteredDocs = useMemo(() => {
+    const q = String(docQuery || '').trim().toLowerCase();
+    const cat = String(docCategoryFilter || '').trim();
+    const onlyBound = !!docOnlyBound;
+    const list = Array.isArray(docs) ? docs : [];
+
+    const matches = (d) => {
+      if (onlyBound && !(Array.isArray(d?.agent_ids) && d.agent_ids.length > 0)) return false;
+      if (cat && !(Array.isArray(d?.categories) && d.categories.includes(cat))) return false;
+      if (!q) return true;
+      const hay = [
+        String(d?.id || ''),
+        String(d?.title || ''),
+        String(d?.source || ''),
+        Array.isArray(d?.categories) ? d.categories.join(' ') : '',
+      ]
+        .join(' ')
+        .toLowerCase();
+      return hay.includes(q);
+    };
+
+    const parsedTs = (d) => {
+      const raw = String(d?.created_at || '');
+      const ts = Date.parse(raw);
+      return Number.isFinite(ts) ? ts : 0;
+    };
+
+    const out = list.filter(matches);
+    if (docSort === 'title') {
+      out.sort((a, b) => String(a?.title || '').localeCompare(String(b?.title || ''), 'zh-Hans-CN'));
+    } else {
+      out.sort((a, b) => parsedTs(b) - parsedTs(a));
+    }
+    return out;
+  }, [docs, docQuery, docCategoryFilter, docOnlyBound, docSort]);
 
   async function reload() {
     setIsLoading(true);
@@ -354,8 +412,8 @@ export default function KnowledgeBasePage({ onBack }) {
     <div className="kbpage">
       <div className="kbpage-toolbar">
         <div className="kbpage-toolbar-left">
-          <div className="kbpage-title">知识库上传</div>
-          <div className="kbpage-subtitle">支持 .txt / .md / .docx / .xlsx，并自动生成标题与预览（Office 文件在入库时解析）</div>
+          <div className="kbpage-title">知识库</div>
+          <div className="kbpage-subtitle">上传/导入、分类管理、查看原文（支持 Markdown 渲染）</div>
         </div>
         <div className="kbpage-toolbar-right">
           <button className="kbpage-btn" onClick={reload} disabled={isLoading}>
@@ -371,72 +429,82 @@ export default function KnowledgeBasePage({ onBack }) {
         <div className="kbpage-grid">
           <div className="kbpage-panel">
             <div className="kbpage-panel-header">
-              <div className="kbpage-panel-title">文档（{docs.length}）</div>
+              <div className="kbpage-panel-title">文档（{filteredDocs.length}/{docs.length}）</div>
+              <div className="kbpage-panel-actions">
+                <input
+                  className="kbpage-search"
+                  value={docQuery}
+                  onChange={(e) => setDocQuery(e.target.value)}
+                  placeholder="搜索标题 / source / id / 分类…"
+                />
+                <select
+                  className="kbpage-select"
+                  value={docCategoryFilter}
+                  onChange={(e) => setDocCategoryFilter(e.target.value)}
+                  title="按分类筛选"
+                >
+                  <option value="">全部分类</option>
+                  {existingCategories.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+                <select className="kbpage-select" value={docSort} onChange={(e) => setDocSort(e.target.value)} title="排序">
+                  <option value="recent">最新</option>
+                  <option value="title">标题</option>
+                </select>
+                <button
+                  type="button"
+                  className={`kbpage-btn small ${docOnlyBound ? 'primary' : ''}`}
+                  onClick={() => setDocOnlyBound((v) => !v)}
+                  title="只看已绑定专家的文档"
+                >
+                  仅绑定
+                </button>
+              </div>
             </div>
             {isLoading ? (
               <div className="kbpage-hint">加载中...</div>
             ) : docs.length === 0 ? (
-              <div className="kbpage-hint">暂无文档</div>
+              <div className="kbpage-hint">暂无文档。建议先上传一份材料到知识库。</div>
+            ) : filteredDocs.length === 0 ? (
+              <div className="kbpage-hint">没有匹配的文档（试试清空搜索/筛选条件）。</div>
             ) : (
               <div className="kbpage-docs">
-                  {docs.map((d) => (
-                    <div key={d.id} className="kbpage-doc">
-                      <div className="kbpage-doc-main">
-                        <button
-                          type="button"
-                          className="kbpage-doc-title kbpage-doc-titlebtn"
-                          onClick={() => openDetail(d.id)}
-                          title="查看详情"
-                        >
-                          {d.title}
-                        </button>
+                {filteredDocs.map((d) => {
+                  const key = String(d?.id || '');
+                  const cats = Array.isArray(d?.categories) ? d.categories : [];
+                  const agentCount = Array.isArray(d?.agent_ids) ? d.agent_ids.length : 0;
+                  const created = formatDate(d?.created_at);
+                  return (
+                    <div key={key} className="kbpage-doc">
+                      <button type="button" className="kbpage-doc-main kbpage-doc-mainbtn" onClick={() => openDetail(d.id)}>
+                        <div className="kbpage-doc-title">{d.title || '未命名文档'}</div>
                         <div className="kbpage-doc-sub">
-                          <span className="kbpage-doc-id">id: {d.id}</span>
-                          {d.source ? <span> · {d.source}</span> : null}
+                          <span className="kbpage-chip kbpage-chip-mono">id:{shortId(d.id, 12)}</span>
+                          {d.source ? <span className="kbpage-chip">source:{String(d.source).slice(0, 48)}</span> : null}
+                          {created ? <span className="kbpage-chip">🕒 {created}</span> : null}
+                          {agentCount > 0 ? <span className="kbpage-chip kbpage-chip-blue">绑定 {agentCount}</span> : null}
                         </div>
-                        {Array.isArray(d.categories) && d.categories.length > 0 && (
-                          <div className="kbpage-doc-tags">分类：{d.categories.join('，')}</div>
-                        )}
-                        {Array.isArray(d.agent_ids) && d.agent_ids.length > 0 && (
-                          <div className="kbpage-doc-tags">绑定：{d.agent_ids.length} 位专家</div>
-                        )}
-                        {editingDocId === d.id && (
-                          <div className="kbpage-inline-editor">
-                            <MultiSelectDropdown
-                              options={existingCategories}
-                              value={editingDocCategories}
-                              onChange={setEditingDocCategories}
-                              placeholder="选择分类..."
-                              createPlaceholder="新建分类（回车添加）"
-                            />
-                            <div className="kbpage-inline-actions">
-                              <button
-                                className="kbpage-btn primary"
-                                onClick={() => saveDocCategories(d.id)}
-                                disabled={isLoading}
-                              >
-                                保存分类
-                              </button>
-                              <button
-                                className="kbpage-btn secondary"
-                                onClick={() => {
-                                  setEditingDocId(null);
-                                  setEditingDocCategories([]);
-                                }}
-                                disabled={isLoading}
-                              >
-                                取消
-                              </button>
-                            </div>
+                        {cats.length > 0 ? (
+                          <div className="kbpage-doc-tags">
+                            {cats.slice(0, 3).map((c) => (
+                              <span key={`${key}:${c}`} className="kbpage-tag">
+                                {c}
+                              </span>
+                            ))}
+                            {cats.length > 3 ? <span className="kbpage-tag">+{cats.length - 3}</span> : null}
                           </div>
-                        )}
-                      </div>
+                        ) : null}
+                      </button>
+
                       <div className="kbpage-doc-actions">
-                        <button className="kbpage-btn" onClick={() => openDetail(d.id)} disabled={isLoading}>
-                          详情
+                        <button className="kbpage-btn small" onClick={() => openDetail(d.id)} disabled={isLoading}>
+                          查看
                         </button>
                         <button
-                          className="kbpage-btn"
+                          className="kbpage-btn small"
                           onClick={() => {
                             setEditingDocId((p) => (p === d.id ? null : d.id));
                             setEditingDocCategories(Array.isArray(d.categories) ? d.categories : []);
@@ -445,12 +513,40 @@ export default function KnowledgeBasePage({ onBack }) {
                         >
                           分类
                         </button>
-                        <button className="kbpage-btn danger" onClick={() => remove(d.id)} disabled={isLoading}>
+                        <button className="kbpage-btn small danger" onClick={() => remove(d.id)} disabled={isLoading}>
                           删除
                         </button>
                       </div>
+
+                      {editingDocId === d.id && (
+                        <div className="kbpage-inline-editor">
+                          <MultiSelectDropdown
+                            options={existingCategories}
+                            value={editingDocCategories}
+                            onChange={setEditingDocCategories}
+                            placeholder="选择分类..."
+                            createPlaceholder="新建分类（回车添加）"
+                          />
+                          <div className="kbpage-inline-actions">
+                            <button className="kbpage-btn primary" onClick={() => saveDocCategories(d.id)} disabled={isLoading}>
+                              保存分类
+                            </button>
+                            <button
+                              className="kbpage-btn secondary"
+                              onClick={() => {
+                                setEditingDocId(null);
+                                setEditingDocCategories([]);
+                              }}
+                              disabled={isLoading}
+                            >
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  ))}
+                  );
+                })}
                 </div>
               )}
             </div>
@@ -643,63 +739,134 @@ export default function KnowledgeBasePage({ onBack }) {
         <div className="kbdoc-overlay" onMouseDown={() => setIsDetailOpen(false)}>
           <div className="kbdoc-modal" onMouseDown={(e) => e.stopPropagation()}>
             <div className="kbdoc-header">
-              <div className="kbdoc-title">知识详情</div>
-              <button className="kbdoc-close" onClick={() => setIsDetailOpen(false)}>
-                ✕
-              </button>
+              <div className="kbdoc-titleblock">
+                <div className="kbdoc-title-top">
+                  <div className="kbdoc-title-text">{detailDoc?.title || '知识详情'}</div>
+                </div>
+                <div className="kbdoc-subtitle">
+                  {detailDocId ? (
+                    <span className="kbpage-chip kbpage-chip-mono" title={detailDocId}>
+                      id:{shortId(detailDocId, 16)}
+                    </span>
+                  ) : null}
+                  {detailDoc?.source ? (
+                    <span className="kbpage-chip" title={detailDoc.source}>
+                      source:{String(detailDoc.source).slice(0, 60)}
+                    </span>
+                  ) : null}
+                  {detailDoc?.created_at ? (
+                    <span className="kbpage-chip">🕒 {formatDate(detailDoc.created_at) || detailDoc.created_at}</span>
+                  ) : null}
+                  {Array.isArray(detailDoc?.agent_ids) && detailDoc.agent_ids.length > 0 ? (
+                    <span className="kbpage-chip kbpage-chip-blue">绑定 {detailDoc.agent_ids.length}</span>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="kbdoc-header-actions">
+                <button
+                  type="button"
+                  className="kbdoc-subtlebtn"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(String(detailDocId || ''));
+                    } catch (e) {
+                      void e;
+                    }
+                  }}
+                  disabled={!detailDocId}
+                  title="复制 doc_id"
+                >
+                  复制ID
+                </button>
+                <button
+                  type="button"
+                  className="kbdoc-subtlebtn"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(String(detailDoc?.source || ''));
+                    } catch (e) {
+                      void e;
+                    }
+                  }}
+                  disabled={!detailDoc?.source}
+                  title="复制来源"
+                >
+                  复制来源
+                </button>
+                <button className="kbdoc-close" onClick={() => setIsDetailOpen(false)} title="关闭">
+                  ✕
+                </button>
+              </div>
             </div>
 
             <div className="kbdoc-body">
               <div className="kbdoc-meta">
-                <div className="kbdoc-meta-line">
-                  <span className="kbdoc-meta-k">doc_id:</span> <span className="kbdoc-meta-v">{detailDocId}</span>
+                <div className="kbdoc-meta-grid">
+                  <div className="kbdoc-meta-k">doc_id</div>
+                  <div className="kbdoc-meta-v">{detailDocId || '-'}</div>
+
+                  <div className="kbdoc-meta-k">来源</div>
+                  <div className="kbdoc-meta-v">{detailDoc?.source || '-'}</div>
+
+                  <div className="kbdoc-meta-k">创建时间</div>
+                  <div className="kbdoc-meta-v">{detailDoc?.created_at ? formatDate(detailDoc.created_at) || detailDoc.created_at : '-'}</div>
+
+                  <div className="kbdoc-meta-k">分类</div>
+                  <div className="kbdoc-meta-v">
+                    {Array.isArray(detailDoc?.categories) && detailDoc.categories.length > 0 ? (
+                      <div className="kbdoc-meta-tags">
+                        {detailDoc.categories.map((c) => (
+                          <span key={`cat:${c}`} className="kbpage-tag">
+                            {c}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      '-'
+                    )}
+                  </div>
+
+                  <div className="kbdoc-meta-k">绑定专家</div>
+                  <div className="kbdoc-meta-v">
+                    {Array.isArray(detailDoc?.agent_ids) && detailDoc.agent_ids.length > 0 ? (
+                      <div className="kbdoc-meta-tags">
+                        {detailDoc.agent_ids.map((a) => (
+                          <span key={`agent:${a}`} className="kbpage-tag">
+                            {a}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      '-'
+                    )}
+                  </div>
                 </div>
-                {detailDoc?.title ? (
-                  <div className="kbdoc-meta-line">
-                    <span className="kbdoc-meta-k">标题:</span> <span className="kbdoc-meta-v">{detailDoc.title}</span>
-                  </div>
-                ) : null}
-                {detailDoc?.source ? (
-                  <div className="kbdoc-meta-line">
-                    <span className="kbdoc-meta-k">来源:</span> <span className="kbdoc-meta-v">{detailDoc.source}</span>
-                  </div>
-                ) : null}
-                {detailDoc?.created_at ? (
-                  <div className="kbdoc-meta-line">
-                    <span className="kbdoc-meta-k">创建时间:</span> <span className="kbdoc-meta-v">{detailDoc.created_at}</span>
-                  </div>
-                ) : null}
-                {Array.isArray(detailDoc?.categories) && detailDoc.categories.length > 0 ? (
-                  <div className="kbdoc-meta-line">
-                    <span className="kbdoc-meta-k">分类:</span>{' '}
-                    <span className="kbdoc-meta-v">{detailDoc.categories.join(' / ')}</span>
-                  </div>
-                ) : null}
-                {Array.isArray(detailDoc?.agent_ids) && detailDoc.agent_ids.length > 0 ? (
-                  <div className="kbdoc-meta-line">
-                    <span className="kbdoc-meta-k">绑定专家:</span>{' '}
-                    <span className="kbdoc-meta-v">{detailDoc.agent_ids.join(', ')}</span>
-                  </div>
-                ) : null}
               </div>
 
               <div className="kbdoc-actions">
+                <div className="kbdoc-segment" title="切换展示模式">
+                  <button
+                    type="button"
+                    className={`kbdoc-segbtn ${detailMode === 'render' ? 'on' : ''}`}
+                    onClick={() => setDetailMode('render')}
+                    disabled={detailLoading}
+                  >
+                    渲染
+                  </button>
+                  <button
+                    type="button"
+                    className={`kbdoc-segbtn ${detailMode === 'raw' ? 'on' : ''}`}
+                    onClick={() => setDetailMode('raw')}
+                    disabled={detailLoading}
+                  >
+                    原文
+                  </button>
+                </div>
+
                 <button
-                  className={`kbpage-btn ${detailMode === 'render' ? 'primary' : ''}`}
-                  onClick={() => setDetailMode('render')}
-                  disabled={detailLoading}
-                >
-                  渲染
-                </button>
-                <button
-                  className={`kbpage-btn ${detailMode === 'raw' ? 'primary' : ''}`}
-                  onClick={() => setDetailMode('raw')}
-                  disabled={detailLoading}
-                >
-                  原文
-                </button>
-                <button
-                  className="kbpage-btn secondary"
+                  type="button"
+                  className="kbdoc-subtlebtn"
                   onClick={async () => {
                     try {
                       await navigator.clipboard.writeText(String(detailDoc?.text || ''));
@@ -708,6 +875,7 @@ export default function KnowledgeBasePage({ onBack }) {
                     }
                   }}
                   disabled={detailLoading || !detailDoc?.text}
+                  title="复制全文"
                 >
                   复制全文
                 </button>
@@ -715,6 +883,7 @@ export default function KnowledgeBasePage({ onBack }) {
 
               {detailLoading ? <div className="kbpage-hint">加载中...</div> : null}
               {detailError ? <div className="kbpage-error">{detailError}</div> : null}
+              {!detailLoading && !detailError && !detailDoc ? <div className="kbpage-hint">暂无可显示的内容。</div> : null}
 
               {!detailLoading && detailDoc ? (
                 <div className="kbdoc-content">

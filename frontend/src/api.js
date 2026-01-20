@@ -2,7 +2,9 @@
  * API client for the SynthesisLab backend.
  */
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001';
+const API_BASE =
+  import.meta.env.VITE_API_BASE ||
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8001');
 
 async function getErrorMessage(response, fallback) {
   try {
@@ -140,6 +142,61 @@ export const api = {
     if (!response.ok) {
       throw new Error('Failed to list conversations');
     }
+    return response.json();
+  },
+
+  // Projects
+  async listProjects() {
+    const response = await fetch(`${API_BASE}/api/projects`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(await getErrorMessage(response, 'Failed to list projects'));
+    return response.json();
+  },
+
+  async createProject({ name, description = '' }) {
+    const response = await fetch(`${API_BASE}/api/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, 'Failed to create project'));
+    return response.json();
+  },
+
+  async updateProject(projectId, patch) {
+    const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch || {}),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, 'Failed to update project'));
+    return response.json();
+  },
+
+  async deleteProject(projectId) {
+    const response = await fetch(`${API_BASE}/api/projects/${encodeURIComponent(projectId)}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, 'Failed to delete project'));
+    return response.json();
+  },
+
+  async setConversationArchived(conversationId, archived) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/archive`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archived: !!archived }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, 'Failed to archive conversation'));
+    return response.json();
+  },
+
+  async setConversationProject(conversationId, projectId) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/project`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: projectId || '' }),
+    });
+    if (!response.ok) throw new Error(await getErrorMessage(response, 'Failed to set conversation project'));
     return response.json();
   },
 
@@ -294,6 +351,18 @@ export const api = {
     return response.json();
   },
 
+  async setConversationTitle(conversationId, title) {
+    const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/title`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!response.ok) {
+      throw new Error(await getErrorMessage(response, '修改标题失败'));
+    }
+    return response.json();
+  },
+
   async exportConversation(conversationId) {
     const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/export`);
     if (!response.ok) {
@@ -397,11 +466,11 @@ export const api = {
     return response.json();
   },
 
-  async extractKG({ graph_id, text, model_spec = null, ontology = null }) {
+  async extractKG({ graph_id, text = '', kb_doc_id = '', model_spec = null, ontology = null, async_job = false, conversation_id = '' }) {
     const response = await fetch(`${API_BASE}/api/kg/extract`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ graph_id, text, model_spec, ontology }),
+      body: JSON.stringify({ graph_id, text, kb_doc_id, model_spec, ontology, async_job, conversation_id }),
     });
     if (!response.ok) throw new Error(await getErrorMessage(response, '抽取图谱失败'));
     return response.json();
@@ -489,7 +558,7 @@ export const api = {
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
    * @returns {Promise<void>}
    */
-  async sendMessageStream(conversationId, content, onEvent) {
+  async sendMessageStream(conversationId, content, onEvent, { signal } = {}) {
     const response = await fetch(
       `${API_BASE}/api/conversations/${conversationId}/message/stream`,
       {
@@ -498,6 +567,7 @@ export const api = {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ content }),
+        signal,
       }
     );
 
@@ -507,13 +577,15 @@ export const api = {
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
         if (line.startsWith('data: ')) {

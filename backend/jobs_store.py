@@ -14,7 +14,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .config import PROJECT_ROOT
 
@@ -36,6 +36,10 @@ class Job:
     progress: float
     result: Dict[str, Any]
     error: str
+    idempotency_key: str
+    attempts: int
+    max_attempts: int
+    run_after_ts: float
     created_at: str
     updated_at: str
     injected: bool
@@ -46,6 +50,11 @@ class JobsStore:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
+        self._listeners: List[Callable[[Job], None]] = []
+        self._last_notify: Dict[str, tuple[str, int]] = {}
+
+    def subscribe(self, listener: Callable[[Job], None]) -> None:
+        self._listeners.append(listener)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -56,6 +65,9 @@ class JobsStore:
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
+            # NOTE: Keep migration order safe for older DBs.
+            # If a legacy `jobs` table exists without newer columns, creating indexes that reference
+            # missing columns will fail before the ALTER TABLE migration runs.
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -67,15 +79,56 @@ class JobsStore:
                   progress REAL NOT NULL DEFAULT 0.0,
                   result_json TEXT NOT NULL DEFAULT '{}',
                   error TEXT NOT NULL DEFAULT '',
+                  idempotency_key TEXT NOT NULL DEFAULT '',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  max_attempts INTEGER NOT NULL DEFAULT 0,
+                  run_after_ts REAL NOT NULL DEFAULT 0,
                   injected INTEGER NOT NULL DEFAULT 0,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS jobs_conversation_id ON jobs(conversation_id);
-                CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
-                CREATE INDEX IF NOT EXISTS jobs_updated_at ON jobs(updated_at);
                 """
             )
+            # Lightweight migration for older DBs.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "idempotency_key" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''")
+            if "attempts" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            if "max_attempts" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 0")
+            if "run_after_ts" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN run_after_ts REAL NOT NULL DEFAULT 0")
+            if "injected" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN injected INTEGER NOT NULL DEFAULT 0")
+            if "created_at" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+            if "updated_at" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+
+            # Indexes (best-effort).
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS jobs_conversation_id ON jobs(conversation_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status)")
+                conn.execute("CREATE INDEX IF NOT EXISTS jobs_updated_at ON jobs(updated_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS jobs_idempotency_key ON jobs(job_type, idempotency_key)")
+                conn.execute("CREATE INDEX IF NOT EXISTS jobs_run_after_ts ON jobs(run_after_ts)")
+            except Exception:
+                pass
+
+    def get_by_idempotency(self, *, job_type: str, idempotency_key: str) -> Optional[Job]:
+        job_type = str(job_type or "").strip()
+        idempotency_key = str(idempotency_key or "").strip()
+        if not job_type or not idempotency_key:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE job_type=? AND idempotency_key=? ORDER BY created_at DESC LIMIT 1",
+                (job_type, idempotency_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_job(row)
 
     def create_job(
         self,
@@ -84,15 +137,23 @@ class JobsStore:
         job_type: str,
         conversation_id: str = "",
         payload: Optional[Dict[str, Any]] = None,
+        idempotency_key: str = "",
+        max_attempts: int = 0,
     ) -> Job:
         created_at = _now_iso()
         updated_at = created_at
         payload = payload or {}
+        idempotency_key = str(idempotency_key or "").strip()
+        max_attempts = max(0, min(20, int(max_attempts)))
+        if idempotency_key:
+            existing = self.get_by_idempotency(job_type=job_type, idempotency_key=idempotency_key)
+            if existing and existing.status not in ("failed", "canceled"):
+                return existing
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO jobs(id,job_type,status,conversation_id,payload_json,progress,result_json,error,injected,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO jobs(id,job_type,status,conversation_id,payload_json,progress,result_json,error,idempotency_key,attempts,max_attempts,run_after_ts,injected,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job_id,
@@ -103,6 +164,10 @@ class JobsStore:
                     0.0,
                     "{}",
                     "",
+                    idempotency_key,
+                    0,
+                    max_attempts,
+                    0.0,
                     0,
                     created_at,
                     updated_at,
@@ -150,6 +215,9 @@ class JobsStore:
         result: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
         injected: Optional[bool] = None,
+        attempts: Optional[int] = None,
+        max_attempts: Optional[int] = None,
+        run_after_ts: Optional[float] = None,
     ) -> bool:
         updated_at = _now_iso()
         fields = []
@@ -169,6 +237,15 @@ class JobsStore:
         if injected is not None:
             fields.append("injected=?")
             params.append(1 if injected else 0)
+        if attempts is not None:
+            fields.append("attempts=?")
+            params.append(max(0, int(attempts)))
+        if max_attempts is not None:
+            fields.append("max_attempts=?")
+            params.append(max(0, min(20, int(max_attempts))))
+        if run_after_ts is not None:
+            fields.append("run_after_ts=?")
+            params.append(max(0.0, float(run_after_ts)))
         if not fields:
             return False
         fields.append("updated_at=?")
@@ -176,7 +253,32 @@ class JobsStore:
         params.append(job_id)
         with self._connect() as conn:
             cur = conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id=?", (*params,))
-            return cur.rowcount > 0
+            ok = cur.rowcount > 0
+
+        if ok and self._listeners:
+            job = self.get_job(job_id)
+            if job:
+                should_notify = False
+                # Notify on status change, or on result/error updates.
+                bucket = int(max(0.0, min(1.0, job.progress)) * 20)  # 5% buckets
+                last = self._last_notify.get(job.id)
+                if status is not None and (not last or last[0] != job.status):
+                    should_notify = True
+                if result is not None or error is not None:
+                    should_notify = True
+                if progress is not None and (not last or last[1] != bucket):
+                    # Throttle progress updates.
+                    should_notify = True
+
+                if should_notify:
+                    self._last_notify[job.id] = (job.status, bucket)
+                    for cb in list(self._listeners):
+                        try:
+                            cb(job)
+                        except Exception:
+                            pass
+
+        return ok
 
     def cancel_job(self, job_id: str) -> bool:
         job = self.get_job(job_id)
@@ -185,6 +287,57 @@ class JobsStore:
         if job.status in ("succeeded", "failed", "canceled"):
             return False
         return self.update_job(job_id, status="canceled")
+
+    def requeue_running_jobs(self) -> int:
+        """
+        Best-effort crash recovery: move jobs stuck in 'running' back to 'queued'.
+        Returns the number of jobs requeued.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status='queued', updated_at=? WHERE status='running'",
+                (updated_at,),
+            )
+            return int(cur.rowcount or 0)
+
+    def list_queued_job_ids(self, *, limit: int = 2000) -> List[str]:
+        limit = max(1, min(20000, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [str(r["id"]) for r in rows if r and r["id"]]
+
+    def claim_job(self, job_id: str) -> bool:
+        """
+        Atomically claim a queued job for execution.
+        Prevents duplicate execution when multiple workers are running.
+        """
+        updated_at = _now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status='running', updated_at=? WHERE id=? AND status='queued'",
+                (updated_at, job_id),
+            )
+            return bool(cur.rowcount and int(cur.rowcount) > 0)
+
+    def cleanup_terminal_jobs(self, *, max_age_days: int = 14) -> int:
+        """
+        Delete old terminal jobs to keep the DB small and avoid unbounded growth.
+        Returns number of deleted rows.
+        """
+        from datetime import timedelta
+
+        days = max(1, int(max_age_days))
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM jobs WHERE status IN ('succeeded','failed','canceled') AND updated_at < ?",
+                (cutoff,),
+            )
+            return int(cur.rowcount or 0)
 
     def fetch_injectable_summaries(self, *, conversation_id: str, limit: int = 4) -> List[Dict[str, Any]]:
         """
@@ -244,8 +397,11 @@ class JobsStore:
             progress=float(row["progress"] or 0.0),
             result=result if isinstance(result, dict) else {},
             error=row["error"] or "",
+            idempotency_key=str(row["idempotency_key"] or ""),
+            attempts=int(row["attempts"] or 0),
+            max_attempts=int(row["max_attempts"] or 0),
+            run_after_ts=float(row["run_after_ts"] or 0.0),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             injected=bool(int(row["injected"] or 0)),
         )
-

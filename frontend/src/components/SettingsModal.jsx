@@ -67,6 +67,7 @@ export default function SettingsModal({ open, onClose }) {
         roundtable_rounds: normalizeRounds(settings.roundtable_rounds),
         enable_agent_web_search: Boolean(settings.enable_agent_web_search),
         agent_web_search_results: normalizeAgentSearchResults(settings.agent_web_search_results),
+        enable_agent_auto_tools: Boolean(settings.enable_agent_auto_tools),
         enable_report_generation: Boolean(settings.enable_report_generation),
         report_instructions: String(settings.report_instructions || ''),
         auto_save_report_to_kb: Boolean(settings.auto_save_report_to_kb),
@@ -126,6 +127,17 @@ export default function SettingsModal({ open, onClose }) {
                 }
               />
               <span>允许每个 Agent 进行网页检索（每人一次）</span>
+            </label>
+
+            <label className="settings-row">
+              <input
+                type="checkbox"
+                checked={Boolean(settings.enable_agent_auto_tools)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, enable_agent_auto_tools: e.target.checked }))
+                }
+              />
+              <span>允许 Agent 自动触发后台工具（通过 ```tool JSON``` 请求）</span>
             </label>
 
             <div className="settings-row-inline">

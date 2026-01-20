@@ -37,6 +37,17 @@ class KBStore:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
+        self._rev = 0
+
+    @property
+    def revision(self) -> int:
+        return int(self._rev)
+
+    def _bump_rev(self) -> None:
+        try:
+            self._rev += 1
+        except Exception:
+            self._rev = int(self._rev or 0) + 1
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -144,6 +155,7 @@ class KBStore:
                     (chunk_id, doc_id, c),
                 )
 
+        self._bump_rev()
         return {"doc_id": doc_id, "chunks": len(chunks)}
 
     def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
@@ -210,7 +222,10 @@ class KBStore:
                 pass
             conn.execute("DELETE FROM kb_chunks_fts WHERE doc_id=?", (doc_id,))
             cur = conn.execute("DELETE FROM kb_documents WHERE id=?", (doc_id,))
-            return cur.rowcount > 0
+            ok = cur.rowcount > 0
+        if ok:
+            self._bump_rev()
+        return ok
 
     def set_document_agents(self, doc_id: str, agent_ids: List[str]) -> bool:
         import json
@@ -220,7 +235,10 @@ class KBStore:
                 "UPDATE kb_documents SET agent_ids_json=? WHERE id=?",
                 (json.dumps(agent_ids, ensure_ascii=False), doc_id),
             )
-            return cur.rowcount > 0
+            ok = cur.rowcount > 0
+        if ok:
+            self._bump_rev()
+        return ok
 
     def set_document_categories(self, doc_id: str, categories: List[str]) -> bool:
         import json
@@ -240,7 +258,10 @@ class KBStore:
                 "UPDATE kb_documents SET categories_json=? WHERE id=?",
                 (json.dumps(deduped, ensure_ascii=False), doc_id),
             )
-            return cur.rowcount > 0
+            ok = cur.rowcount > 0
+        if ok:
+            self._bump_rev()
+        return ok
 
     def search(
         self,
@@ -319,6 +340,7 @@ class KBStore:
         doc_ids: Optional[List[str]] = None,
         categories: Optional[List[str]] = None,
         limit: int = 2000,
+        include_text: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         List chunks with doc metadata. Used for semantic search.
@@ -345,9 +367,10 @@ class KBStore:
                     params.extend([f'%\"{c}\"%' for c in cats])
 
             where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+            text_sql = "c.text AS text" if include_text else "'' AS text"
             rows = conn.execute(
                 f"""
-                SELECT c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text, c.created_at AS created_at,
+                SELECT c.id AS chunk_id, c.doc_id AS doc_id, {text_sql}, c.created_at AS created_at,
                        d.title AS title, d.source AS source, d.categories_json AS categories_json, d.agent_ids_json AS agent_ids_json
                 FROM kb_chunks c
                 JOIN kb_documents d ON d.id = c.doc_id
@@ -372,6 +395,64 @@ class KBStore:
                     "created_at": r["created_at"],
                 }
             )
+        return out
+
+    def get_chunk_texts(self, *, chunk_ids: List[str]) -> Dict[str, str]:
+        if not chunk_ids:
+            return {}
+        placeholders = ",".join(["?"] * len(chunk_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT id AS chunk_id, text AS text FROM kb_chunks WHERE id IN ({placeholders})",
+                (*chunk_ids,),
+            ).fetchall()
+        out: Dict[str, str] = {}
+        for r in rows:
+            out[str(r["chunk_id"])] = str(r["text"] or "")
+        return out
+
+    def get_chunk_details(self, *, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetch chunk text + doc metadata for specific chunk IDs.
+        Returned order matches the input list (best-effort).
+        """
+        import json
+
+        chunk_ids = [cid for cid in (chunk_ids or []) if (cid or "").strip()]
+        if not chunk_ids:
+            return []
+
+        placeholders = ",".join(["?"] * len(chunk_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT c.id AS chunk_id, c.doc_id AS doc_id, c.text AS text, c.created_at AS created_at,
+                       d.title AS title, d.source AS source, d.categories_json AS categories_json, d.agent_ids_json AS agent_ids_json
+                FROM kb_chunks c
+                JOIN kb_documents d ON d.id = c.doc_id
+                WHERE c.id IN ({placeholders})
+                """,
+                (*chunk_ids,),
+            ).fetchall()
+
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            by_id[str(r["chunk_id"])] = {
+                "chunk_id": r["chunk_id"],
+                "doc_id": r["doc_id"],
+                "text": r["text"],
+                "title": r["title"],
+                "source": r["source"],
+                "categories": json.loads(r["categories_json"] or "[]"),
+                "agent_ids": json.loads(r["agent_ids_json"] or "[]"),
+                "created_at": r["created_at"],
+            }
+
+        out: List[Dict[str, Any]] = []
+        for cid in chunk_ids:
+            item = by_id.get(cid)
+            if item:
+                out.append(item)
         return out
 
     def get_chunk_embeddings(self, *, chunk_ids: List[str], model_spec: str) -> Dict[str, List[float]]:
@@ -412,6 +493,7 @@ class KBStore:
                     """,
                     (chunk_id, model_spec, json.dumps(vec), created_at),
                 )
+        self._bump_rev()
         return len(items)
 
     def get_source_file(self, path: str) -> Optional[Dict[str, Any]]:
@@ -484,11 +566,15 @@ class KBStore:
                     updated_at,
                 ),
             )
+        self._bump_rev()
 
     def delete_source_file(self, path: str) -> bool:
         with self._connect() as conn:
             cur = conn.execute("DELETE FROM kb_source_files WHERE path=?", (path,))
-            return cur.rowcount > 0
+            ok = cur.rowcount > 0
+        if ok:
+            self._bump_rev()
+        return ok
 
     def list_source_files(self, *, roots: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         import json

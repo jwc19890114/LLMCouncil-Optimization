@@ -1,17 +1,22 @@
 """FastAPI backend for SynthesisLab."""
 
 import os
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import uuid
 import json
 import asyncio
+import hashlib
+import re
 
 from . import storage
 from . import agents_store, trace_store, settings_store
+from .config import PROJECT_ROOT
 from .llm_client import parse_model_spec, query_model
 from .council import (
     calculate_aggregate_rankings,
@@ -30,14 +35,15 @@ from .council import (
 from .kb_store import KBStore
 from .kb_retrieval import KBHybridRetriever
 from .entity_type_normalizer import canonicalize_entity_type
-from .kg_extractor import DEFAULT_ONTOLOGY, extract_kg_incremental
+from .kg_extractor import DEFAULT_ONTOLOGY, iter_extract_kg_chunks
 from .kg_interpret import build_components, interpret_entity, summarize_community
 from .neo4j_store import KGChunk, KGEntity, KGRelation, Neo4jKGStore
-from .jobs_store import JobsStore
+from .jobs_store import JobsStore, Job
 from .job_runner import JobRunner
 from .tool_context import ToolContext
 from .plugin_manager import PluginManager
 from .kb_store import KBStore
+from . import projects_store
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
@@ -65,6 +71,36 @@ class CreateConversationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
+
+
+class ConversationTitleRequest(BaseModel):
+    title: str
+
+
+class ConversationArchiveRequest(BaseModel):
+    archived: bool = False
+
+
+class ConversationProjectRequest(BaseModel):
+    project_id: str = ""
+
+
+class Project(BaseModel):
+    id: str
+    created_at: str
+    name: str
+    description: str = ""
+    kb_doc_ids: List[str] = []
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
 
 
 class AgentUpsertRequest(BaseModel):
@@ -120,6 +156,9 @@ class SettingsPatchRequest(BaseModel):
     report_kb_category: Optional[str] = None
     enable_history_context: Optional[bool] = None
     history_max_messages: Optional[int] = None
+    job_tool_limits: Optional[Dict[str, int]] = None
+    job_default_timeouts: Optional[Dict[str, int]] = None
+    job_result_ttls: Optional[Dict[str, int]] = None
 
 class PluginPatchRequest(BaseModel):
     enabled: Optional[bool] = None
@@ -165,12 +204,13 @@ class KBAddBatchRequest(BaseModel):
 
 
 class KGExtractRequest(BaseModel):
-    text: str
+    text: str = ""
     graph_id: str
     model_spec: Optional[str] = None
     ontology: Optional[Dict[str, Any]] = None
     async_job: bool = False
     conversation_id: str = ""
+    kb_doc_id: str = ""
 
 
 class KGCreateRequest(BaseModel):
@@ -192,6 +232,8 @@ class ConversationMetadata(BaseModel):
     created_at: str
     title: str
     message_count: int
+    archived: bool = False
+    project_id: str = ""
 
 
 class Conversation(BaseModel):
@@ -199,6 +241,8 @@ class Conversation(BaseModel):
     id: str
     created_at: str
     title: str
+    archived: bool = False
+    project_id: str = ""
     agent_ids: Optional[List[str]] = None
     chairman_model: str = ""
     chairman_agent_id: str = ""
@@ -242,7 +286,10 @@ class ConversationInvokeRequest(BaseModel):
 class JobCreateRequest(BaseModel):
     job_type: str
     conversation_id: str = ""
-    payload: Dict[str, Any] = {}
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = ""
+    max_attempts: int = 0
+    force_new: bool = False
 
 
 @app.get("/")
@@ -410,6 +457,11 @@ async def get_settings():
 async def patch_settings(request: SettingsPatchRequest):
     patch = request.model_dump(exclude_none=True)
     s = settings_store.update_settings(patch)
+    try:
+        job_runner.configure(tool_limits=s.job_tool_limits, default_timeouts=s.job_default_timeouts)
+        job_runner.configure_result_ttls(result_ttls=s.job_result_ttls)
+    except Exception:
+        pass
     return {"ok": True, "settings": s.__dict__}
 
 
@@ -448,21 +500,312 @@ from .kb_watch import KBWatchService
 kb_watch = KBWatchService(kb, kb_retriever)
 jobs_store = JobsStore()
 job_runner = JobRunner(jobs_store, workers=1)
+try:
+    _s0 = settings_store.get_settings()
+    job_runner.configure(tool_limits=_s0.job_tool_limits, default_timeouts=_s0.job_default_timeouts)
+    job_runner.configure_result_ttls(result_ttls=_s0.job_result_ttls)
+except Exception:
+    pass
 plugin_manager = PluginManager()
-tool_ctx = ToolContext(kb_retriever=kb_retriever, get_neo4j=lambda: _get_neo4j())
+tool_ctx = ToolContext(
+    kb_retriever=kb_retriever,
+    get_neo4j=lambda: _get_neo4j(),
+    is_job_cancelled=job_runner.is_job_cancelled,
+    check_job_cancelled=job_runner.check_job_cancelled,
+)
+
+# Simple SSE pub-sub for job updates (no WebSocket).
+_job_streams: dict[str, set[asyncio.Queue]] = {}
+_job_terminal_handled: set[str] = set()
+_maintenance_tasks: list[asyncio.Task] = []
+
+
+def _publish_job_event(conversation_id: str, payload: dict) -> None:
+    cid = (conversation_id or "").strip()
+    if not cid:
+        return
+    qs = list(_job_streams.get(cid) or [])
+    if not qs:
+        return
+    for q in qs:
+        try:
+            q.put_nowait(payload)
+        except Exception:
+            pass
+
+
+_TOOL_BLOCK_RE = re.compile(r"```tool\s*([\s\S]*?)```", re.IGNORECASE)
+_PAPER_SOURCES_ALLOWED = {"arxiv", "scholar", "cnki"}
+_CITATION_INTENT_RE = re.compile(
+    r"(查阅文献|查文献|文献检索|检索文献|学术期刊|期刊论文|参考文献|引用文献|帮我找论文|找论文|paper search|scholar|arxiv|cnki)",
+    re.IGNORECASE,
+)
+
+
+def _extract_tool_blocks(text: str) -> tuple[str, list[dict]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return "", []
+
+    tool_requests: list[dict] = []
+    for m in _TOOL_BLOCK_RE.finditer(raw):
+        body = (m.group(1) or "").strip()
+        if not body:
+            continue
+        try:
+            obj = json.loads(body)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            tool_requests.append(obj)
+
+    clean = _TOOL_BLOCK_RE.sub("", raw)
+    clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    return clean, tool_requests
+
+
+def _clean_paper_sources(val) -> list[str]:
+    if not isinstance(val, list):
+        return []
+    out: list[str] = []
+    seen = set()
+    for it in val:
+        s = str(it or "").strip().lower()
+        if not s or s in seen or s not in _PAPER_SOURCES_ALLOWED:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _maybe_autocall_tools_from_stage1(stage1_results: list[dict], conversation_id: str) -> None:
+    settings = settings_store.get_settings()
+    if not settings.enable_agent_auto_tools:
+        for item in stage1_results:
+            if isinstance(item, dict):
+                item.pop("tool_requests", None)
+        return
+
+    if not plugin_manager.registry.get("paper_search"):
+        for item in stage1_results:
+            if isinstance(item, dict):
+                item.pop("tool_requests", None)
+        return
+
+    created = 0
+    max_created = 3  # safety: avoid spawning too many jobs per user message
+
+    for item in stage1_results:
+        if created >= max_created:
+            break
+        if not isinstance(item, dict):
+            continue
+        reqs = item.pop("tool_requests", None)
+        if not isinstance(reqs, list) or not reqs:
+            continue
+
+        agent_id = str(item.get("agent_id") or "").strip()
+        agent_name = str(item.get("agent_name") or "").strip()
+
+        for req in reqs:
+            if created >= max_created:
+                break
+            if not isinstance(req, dict):
+                continue
+            tool = str(req.get("tool") or "").strip().lower()
+            if tool != "paper_search":
+                continue
+
+            query = str(req.get("query") or "").strip()
+            if not query:
+                continue
+
+            sources = _clean_paper_sources(req.get("sources")) or ["arxiv"]
+            try:
+                max_results = int(req.get("max_results") or 5)
+            except Exception:
+                max_results = 5
+            max_results = max(1, min(20, max_results))
+
+            key_material = f"{agent_id or agent_name}|{tool}|{query}|{','.join(sources)}|{max_results}"
+            idem = "auto:" + hashlib.sha1(key_material.encode("utf-8")).hexdigest()[:24]
+
+            job = job_runner.create_and_enqueue(
+                job_type="paper_search",
+                payload={"query": query, "sources": sources, "max_results": max_results},
+                conversation_id=conversation_id,
+                idempotency_key=idem,
+                max_attempts=0,
+                force_new=False,
+            )
+
+            msg = storage.make_job_event_message(
+                job_id=job.id,
+                job_type=job.job_type,
+                status=job.status,
+                progress=job.progress,
+                summary=str((job.result or {}).get("summary") or "").strip(),
+                error=job.error,
+                conversation_id=conversation_id,
+            )
+            try:
+                storage.add_job_event_message(conversation_id, message=msg)
+            except Exception:
+                pass
+            _publish_job_event(conversation_id, {"type": "job_update", "job": job.__dict__, "message": msg})
+            created += 1
+
+
+def _maybe_autocall_paper_search_from_user_request(user_text: str, conversation_id: str) -> None:
+    settings = settings_store.get_settings()
+    if not settings.enable_agent_auto_tools:
+        return
+    if not plugin_manager.registry.get("paper_search"):
+        return
+    if not _CITATION_INTENT_RE.search(str(user_text or "")):
+        return
+
+    q = " ".join(str(user_text or "").split())
+    q = q.strip()
+    if not q:
+        return
+    # Keep query bounded to avoid accidental huge prompts.
+    if len(q) > 160:
+        q = q[:160].rstrip()
+
+    sources = ["cnki", "arxiv"]
+    max_results = 10
+
+    key_material = f"user|paper_search|{q}|{','.join(sources)}|{max_results}"
+    idem = "auto:" + hashlib.sha1(key_material.encode("utf-8")).hexdigest()[:24]
+
+    job = job_runner.create_and_enqueue(
+        job_type="paper_search",
+        payload={"query": q, "sources": sources, "max_results": max_results},
+        conversation_id=conversation_id,
+        idempotency_key=idem,
+        max_attempts=0,
+        force_new=False,
+    )
+    msg = storage.make_job_event_message(
+        job_id=job.id,
+        job_type=job.job_type,
+        status=job.status,
+        progress=job.progress,
+        summary=str((job.result or {}).get("summary") or "").strip(),
+        error=job.error,
+        conversation_id=conversation_id,
+    )
+    try:
+        storage.add_job_event_message(conversation_id, message=msg)
+    except Exception:
+        pass
+    _publish_job_event(conversation_id, {"type": "job_update", "job": job.__dict__, "message": msg})
+
+
+def _job_to_kb_text(job: Job) -> tuple[str, str, list[str]]:
+    import json as _json
+
+    r = job.result or {}
+    jtype = job.job_type
+    title_hint = ""
+    if isinstance(r, dict):
+        title_hint = str(r.get("query") or r.get("graph_id") or "").strip()
+    title = f"Job/{jtype}" + (f": {title_hint}" if title_hint else "")
+    text = (
+        f"# {title}\n\n"
+        f"- job_id: {job.id}\n"
+        f"- status: {job.status}\n"
+        f"- created_at: {job.created_at}\n"
+        f"- updated_at: {job.updated_at}\n\n"
+        "## Summary\n\n"
+        + str(r.get("summary") or "").strip()
+        + "\n\n## Result (JSON)\n\n```json\n"
+        + _json.dumps(r, ensure_ascii=False, indent=2)[:20000]
+        + "\n```\n"
+    ).strip()
+    categories = ["job_results", jtype]
+    return title, text, categories
+
+
+def _on_job_update(job: Job) -> None:
+    cid = (job.conversation_id or "").strip()
+    payload = {"type": "job_update", "job": job.__dict__}
+
+    # Persist + emit a chat-visible message on terminal state once.
+    if cid and job.status in ("succeeded", "failed", "canceled") and job.id not in _job_terminal_handled:
+        _job_terminal_handled.add(job.id)
+
+        kb_doc_id = ""
+        if bool(job.payload.get("save_to_kb")) and job.status == "succeeded":
+            doc_id = f"job_{job.id}"
+            try:
+                if kb.get_document(doc_id) is None:
+                    title, text, categories = _job_to_kb_text(job)
+                    conv = storage.get_conversation(cid) or {}
+                    agent_ids = conv.get("agent_ids")
+                    if not isinstance(agent_ids, list):
+                        agent_ids = []
+                    kb.add_document(doc_id=doc_id, title=title, source=f"job:{job.job_type}", text=text, categories=categories, agent_ids=agent_ids)
+                kb_doc_id = doc_id
+                try:
+                    conv = storage.get_conversation(cid) or {}
+                    project_id = str(conv.get("project_id") or "").strip()
+                    if project_id:
+                        projects_store.add_project_kb_doc_id(project_id, doc_id)
+                except Exception:
+                    pass
+            except Exception:
+                kb_doc_id = ""
+
+        summary = str((job.result or {}).get("summary") or "").strip() if job.status == "succeeded" else ""
+        msg = storage.make_job_event_message(
+            job_id=job.id,
+            job_type=job.job_type,
+            status=job.status,
+            progress=job.progress,
+            summary=summary,
+            error=job.error,
+            kb_doc_id=kb_doc_id,
+            conversation_id=cid,
+        )
+        try:
+            storage.add_job_event_message(cid, message=msg)
+        except Exception:
+            pass
+        payload["message"] = msg
+
+    _publish_job_event(cid, payload)
 
 
 @app.on_event("startup")
 async def _startup_tasks():
     job_runner.set_tools(plugin_manager.registry, tool_ctx)
+    jobs_store.subscribe(_on_job_update)
     await job_runner.start()
     await kb_watch.start()
+
+    async def _periodic_maintenance() -> None:
+        while True:
+            try:
+                jobs_store.cleanup_terminal_jobs(max_age_days=14)
+            except Exception:
+                pass
+            await asyncio.sleep(12 * 60 * 60)
+
+    _maintenance_tasks.append(asyncio.create_task(_periodic_maintenance()))
 
 
 @app.on_event("shutdown")
 async def _shutdown_tasks():
     await kb_watch.stop()
     await job_runner.stop()
+    for t in list(_maintenance_tasks):
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    _maintenance_tasks.clear()
 
 
 @app.get("/api/kb/documents")
@@ -624,6 +967,12 @@ async def kb_upload_document(
         existing = conv.get("kb_doc_ids") or []
         merged = list(existing) + [doc_id]
         storage.update_conversation_kb_doc_ids(conversation_id, merged)
+        project_id = str(conv.get("project_id") or "").strip()
+        if project_id:
+            try:
+                projects_store.add_project_kb_doc_id(project_id, doc_id)
+            except Exception:
+                pass
 
     # Optional: index embeddings (best-effort)
     model = (embedding_model or settings.kb_embedding_model or "").strip()
@@ -667,6 +1016,20 @@ async def kb_index(request: KBIndexRequest):
             raise HTTPException(status_code=404, detail="Conversation not found")
         if not plugin_manager.registry.get("kb_index"):
             raise HTTPException(status_code=400, detail="Plugin disabled: kb_index")
+        try:
+            key_payload = {
+                "embedding_model": model,
+                "agent_id": request.agent_id or "",
+                "doc_ids": request.doc_ids or [],
+                "categories": request.categories or [],
+                "pool": int(request.pool or 5000),
+            }
+            idempotency_key = hashlib.sha1(
+                json.dumps(key_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            idempotency_key = ""
+
         job = job_runner.create_and_enqueue(
             job_type="kb_index",
             conversation_id=conversation_id,
@@ -677,6 +1040,8 @@ async def kb_index(request: KBIndexRequest):
                 "categories": request.categories,
                 "pool": int(request.pool or 5000),
             },
+            idempotency_key=f"kb_index:{idempotency_key}" if idempotency_key else "",
+            max_attempts=2,
         )
         return {"ok": True, "queued": True, "job": job.__dict__}
     return await kb_retriever.index_embeddings(
@@ -789,21 +1154,43 @@ async def kg_create_graph(request: KGCreateRequest):
 
 @app.post("/api/kg/extract")
 async def kg_extract_and_upsert(request: KGExtractRequest):
+    kb_doc_id = (request.kb_doc_id or "").strip()
+    text = (request.text or "").strip()
+    if not kb_doc_id and not text:
+        raise HTTPException(status_code=400, detail="text or kb_doc_id required")
     if bool(request.async_job):
         conversation_id = (request.conversation_id or "").strip()
         if conversation_id and storage.get_conversation(conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         if not plugin_manager.registry.get("kg_extract"):
             raise HTTPException(status_code=400, detail="Plugin disabled: kg_extract")
+        try:
+            key_payload = {
+                "graph_id": request.graph_id,
+                "kb_doc_id": kb_doc_id,
+                "text_sha1": hashlib.sha1(text.encode("utf-8")).hexdigest() if text else "",
+                "model_spec": request.model_spec or "",
+                "ontology": request.ontology or DEFAULT_ONTOLOGY,
+            }
+            idempotency_key = hashlib.sha1(
+                json.dumps(key_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            idempotency_key = ""
+
         job = job_runner.create_and_enqueue(
             job_type="kg_extract",
             conversation_id=conversation_id,
             payload={
                 "graph_id": request.graph_id,
-                "text": request.text,
+                "text": text,
+                "kb_doc_id": kb_doc_id,
                 "model_spec": request.model_spec or "",
                 "ontology": request.ontology or DEFAULT_ONTOLOGY,
+                "timeout_seconds": 60 * 30,
             },
+            idempotency_key=f"kg_extract:{idempotency_key}" if idempotency_key else "",
+            max_attempts=1,
         )
         return {"ok": True, "queued": True, "job": job.__dict__}
 
@@ -812,104 +1199,217 @@ async def kg_extract_and_upsert(request: KGExtractRequest):
     model_spec = request.model_spec or models["chairman_model"]
 
     ontology = request.ontology or DEFAULT_ONTOLOGY
-    extracted = await extract_kg_incremental(model_spec=model_spec, text=request.text, ontology=ontology)
 
     store = _get_neo4j()
     try:
-        chunks = extracted.get("chunks") or []
         total_entities = 0
         total_relations = 0
+        extracted_chunks = 0
 
-        for c in chunks:
-            chunk_id = f"chunk_{uuid.uuid4().hex[:12]}"
-            chunk_text = str((c.get("text") or "")) if isinstance(c, dict) else ""
-            store.upsert_chunk(KGChunk(graph_id=request.graph_id, chunk_id=chunk_id, text=chunk_text))
-
-            entities_in_chunk = c.get("entities") or []
-            relations_in_chunk = c.get("relations") or []
-
-            entities: List[KGEntity] = []
-            uuid_by_key: Dict[str, str] = {}
-            for ent in entities_in_chunk:
-                raw_type = ent.get("type", "")
-                canonical_type = canonicalize_entity_type(raw_type)
-                name = (ent.get("name") or "").strip()
-                if not name:
-                    continue
-                eobj = KGEntity(
-                    graph_id=request.graph_id,
-                    name=name,
-                    entity_type=canonical_type,
-                    summary=(ent.get("summary") or "").strip(),
-                    attributes=ent.get("attributes") or {},
-                    source_entity_types=[str(raw_type).strip()] if raw_type else [],
-                )
-                entities.append(eobj)
-                uuid_by_key[f"{canonical_type}:{name}".lower()] = eobj.uuid
-
-            if entities:
-                entity_uuids = store.upsert_entities(entities)
-                store.link_mentions(chunk_id=chunk_id, entity_uuids=entity_uuids, graph_id=request.graph_id)
-                total_entities += len(entities)
-
-            relations: List[KGRelation] = []
-            # Ensure endpoints exist for relations, even if not emitted as entities in this chunk.
-            missing_endpoint_entities: List[KGEntity] = []
-            for rel in relations_in_chunk:
-                s_type_raw = rel.get("source_type") or "Entity"
-                t_type_raw = rel.get("target_type") or "Entity"
-                s_type = canonicalize_entity_type(s_type_raw)
-                t_type = canonicalize_entity_type(t_type_raw)
-                s_name = (rel.get("source") or "").strip()
-                t_name = (rel.get("target") or "").strip()
-                if not s_name or not t_name:
-                    continue
-                s_key = f"{s_type}:{s_name}".lower()
-                t_key = f"{t_type}:{t_name}".lower()
-                s_uuid = uuid_by_key.get(s_key) or _stable_uuid_fallback(request.graph_id, s_type, s_name)
-                t_uuid = uuid_by_key.get(t_key) or _stable_uuid_fallback(request.graph_id, t_type, t_name)
-
-                if s_key not in uuid_by_key:
-                    missing_endpoint_entities.append(
-                        KGEntity(
+        if kb_doc_id:
+            kb_chunks = kb.list_chunks(doc_ids=[kb_doc_id], limit=100000, include_text=True)
+            if not kb_chunks:
+                raise HTTPException(status_code=404, detail=f"KB doc not found or empty: {kb_doc_id}")
+            for kidx, kb_chunk in enumerate(kb_chunks, start=1):
+                chunk_text_full = str(kb_chunk.get("text") or "")
+                async for c in iter_extract_kg_chunks(model_spec=model_spec, text=chunk_text_full, ontology=ontology):
+                    extracted_chunks += 1
+                    kg_chunk_id = f"{kb_chunk['chunk_id']}_{extracted_chunks}"
+                    # Store only preview + reference to KB chunk.
+                    store.upsert_chunk(
+                        KGChunk(
                             graph_id=request.graph_id,
-                            name=s_name,
-                            entity_type=s_type,
-                            summary="",
-                            attributes={},
-                            source_entity_types=[str(s_type_raw).strip()] if s_type_raw else [],
-                        )
-                    )
-                if t_key not in uuid_by_key:
-                    missing_endpoint_entities.append(
-                        KGEntity(
-                            graph_id=request.graph_id,
-                            name=t_name,
-                            entity_type=t_type,
-                            summary="",
-                            attributes={},
-                            source_entity_types=[str(t_type_raw).strip()] if t_type_raw else [],
+                            chunk_id=kg_chunk_id,
+                            text_preview=str((c.get('text') or '')) if isinstance(c, dict) else "",
+                            kb_doc_id=kb_doc_id,
+                            kb_chunk_id=str(kb_chunk["chunk_id"]),
+                            source=f"kb:{kb_doc_id}",
                         )
                     )
 
-                relations.append(
-                    KGRelation(
+                    entities_in_chunk = c.get("entities") or []
+                    relations_in_chunk = c.get("relations") or []
+
+                    entities: List[KGEntity] = []
+                    uuid_by_key: Dict[str, str] = {}
+                    for ent in entities_in_chunk:
+                        raw_type = ent.get("type", "")
+                        canonical_type = canonicalize_entity_type(raw_type)
+                        name = (ent.get("name") or "").strip()
+                        if not name:
+                            continue
+                        eobj = KGEntity(
+                            graph_id=request.graph_id,
+                            name=name,
+                            entity_type=canonical_type,
+                            summary=(ent.get("summary") or "").strip(),
+                            attributes=ent.get("attributes") or {},
+                            source_entity_types=[str(raw_type).strip()] if raw_type else [],
+                        )
+                        entities.append(eobj)
+                        uuid_by_key[f"{canonical_type}:{name}".lower()] = eobj.uuid
+
+                    if entities:
+                        entity_uuids = store.upsert_entities(entities)
+                        store.link_mentions(chunk_id=kg_chunk_id, entity_uuids=entity_uuids, graph_id=request.graph_id)
+                        total_entities += len(entities)
+
+                    relations: List[KGRelation] = []
+                    # Ensure endpoints exist for relations, even if not emitted as entities in this chunk.
+                    missing_endpoint_entities: List[KGEntity] = []
+                    for rel in relations_in_chunk:
+                        s_type_raw = rel.get("source_type") or "Entity"
+                        t_type_raw = rel.get("target_type") or "Entity"
+                        s_type = canonicalize_entity_type(s_type_raw)
+                        t_type = canonicalize_entity_type(t_type_raw)
+                        s_name = (rel.get("source") or "").strip()
+                        t_name = (rel.get("target") or "").strip()
+                        if not s_name or not t_name:
+                            continue
+                        s_key = f"{s_type}:{s_name}".lower()
+                        t_key = f"{t_type}:{t_name}".lower()
+                        s_uuid = uuid_by_key.get(s_key) or _stable_uuid_fallback(request.graph_id, s_type, s_name)
+                        t_uuid = uuid_by_key.get(t_key) or _stable_uuid_fallback(request.graph_id, t_type, t_name)
+
+                        if s_key not in uuid_by_key:
+                            missing_endpoint_entities.append(
+                                KGEntity(
+                                    graph_id=request.graph_id,
+                                    name=s_name,
+                                    entity_type=s_type,
+                                    summary="",
+                                    attributes={},
+                                    source_entity_types=[str(s_type_raw).strip()] if s_type_raw else [],
+                                )
+                            )
+                        if t_key not in uuid_by_key:
+                            missing_endpoint_entities.append(
+                                KGEntity(
+                                    graph_id=request.graph_id,
+                                    name=t_name,
+                                    entity_type=t_type,
+                                    summary="",
+                                    attributes={},
+                                    source_entity_types=[str(t_type_raw).strip()] if t_type_raw else [],
+                                )
+                            )
+
+                        relations.append(
+                            KGRelation(
+                                graph_id=request.graph_id,
+                                source_uuid=s_uuid,
+                                target_uuid=t_uuid,
+                                relation_name=(rel.get("relation") or "").strip(),
+                                fact=(rel.get("fact") or "").strip(),
+                                attributes=rel.get("attributes") or {},
+                            )
+                        )
+
+                    if missing_endpoint_entities:
+                        store.upsert_entities(missing_endpoint_entities)
+                    if relations:
+                        store.upsert_relations(relations)
+                        total_relations += len(relations)
+        else:
+            async for c in iter_extract_kg_chunks(model_spec=model_spec, text=text, ontology=ontology):
+                extracted_chunks += 1
+                chunk_id = f"chunk_{uuid.uuid4().hex[:12]}"
+                chunk_text = str((c.get("text") or "")) if isinstance(c, dict) else ""
+                store.upsert_chunk(
+                    KGChunk(
                         graph_id=request.graph_id,
-                        source_uuid=s_uuid,
-                        target_uuid=t_uuid,
-                        relation_name=(rel.get("relation") or "").strip(),
-                        fact=(rel.get("fact") or "").strip(),
-                        attributes=rel.get("attributes") or {},
+                        chunk_id=chunk_id,
+                        text_preview=chunk_text,
+                        kb_doc_id="",
+                        kb_chunk_id="",
+                        source="direct:text",
                     )
                 )
 
-            if missing_endpoint_entities:
-                store.upsert_entities(missing_endpoint_entities)
-            if relations:
-                store.upsert_relations(relations)
-                total_relations += len(relations)
+                entities_in_chunk = c.get("entities") or []
+                relations_in_chunk = c.get("relations") or []
 
-        return {"ok": True, "extracted": extracted, "entities": total_entities, "relations": total_relations}
+                entities: List[KGEntity] = []
+                uuid_by_key: Dict[str, str] = {}
+                for ent in entities_in_chunk:
+                    raw_type = ent.get("type", "")
+                    canonical_type = canonicalize_entity_type(raw_type)
+                    name = (ent.get("name") or "").strip()
+                    if not name:
+                        continue
+                    eobj = KGEntity(
+                        graph_id=request.graph_id,
+                        name=name,
+                        entity_type=canonical_type,
+                        summary=(ent.get("summary") or "").strip(),
+                        attributes=ent.get("attributes") or {},
+                        source_entity_types=[str(raw_type).strip()] if raw_type else [],
+                    )
+                    entities.append(eobj)
+                    uuid_by_key[f"{canonical_type}:{name}".lower()] = eobj.uuid
+
+                if entities:
+                    entity_uuids = store.upsert_entities(entities)
+                    store.link_mentions(chunk_id=chunk_id, entity_uuids=entity_uuids, graph_id=request.graph_id)
+                    total_entities += len(entities)
+
+                relations: List[KGRelation] = []
+                missing_endpoint_entities: List[KGEntity] = []
+                for rel in relations_in_chunk:
+                    s_type_raw = rel.get("source_type") or "Entity"
+                    t_type_raw = rel.get("target_type") or "Entity"
+                    s_type = canonicalize_entity_type(s_type_raw)
+                    t_type = canonicalize_entity_type(t_type_raw)
+                    s_name = (rel.get("source") or "").strip()
+                    t_name = (rel.get("target") or "").strip()
+                    if not s_name or not t_name:
+                        continue
+                    s_key = f"{s_type}:{s_name}".lower()
+                    t_key = f"{t_type}:{t_name}".lower()
+                    s_uuid = uuid_by_key.get(s_key) or _stable_uuid_fallback(request.graph_id, s_type, s_name)
+                    t_uuid = uuid_by_key.get(t_key) or _stable_uuid_fallback(request.graph_id, t_type, t_name)
+
+                    if s_key not in uuid_by_key:
+                        missing_endpoint_entities.append(
+                            KGEntity(
+                                graph_id=request.graph_id,
+                                name=s_name,
+                                entity_type=s_type,
+                                summary="",
+                                attributes={},
+                                source_entity_types=[str(s_type_raw).strip()] if s_type_raw else [],
+                            )
+                        )
+                    if t_key not in uuid_by_key:
+                        missing_endpoint_entities.append(
+                            KGEntity(
+                                graph_id=request.graph_id,
+                                name=t_name,
+                                entity_type=t_type,
+                                summary="",
+                                attributes={},
+                                source_entity_types=[str(t_type_raw).strip()] if t_type_raw else [],
+                            )
+                        )
+
+                    relations.append(
+                        KGRelation(
+                            graph_id=request.graph_id,
+                            source_uuid=s_uuid,
+                            target_uuid=t_uuid,
+                            relation_name=(rel.get("relation") or "").strip(),
+                            fact=(rel.get("fact") or "").strip(),
+                            attributes=rel.get("attributes") or {},
+                        )
+                    )
+
+                if missing_endpoint_entities:
+                    store.upsert_entities(missing_endpoint_entities)
+                if relations:
+                    store.upsert_relations(relations)
+                    total_relations += len(relations)
+
+        return {"ok": True, "extracted_chunks": extracted_chunks, "entities": total_entities, "relations": total_relations}
     finally:
         store.close()
 
@@ -989,8 +1489,15 @@ async def kg_interpret(graph_id: str, request: KGInterpretRequest):
                 mentions = []
                 if max_mentions > 0:
                     hits = store.get_entity_mentions(graph_id=graph_id, entity_uuid=eid, limit=max_mentions)
+                    kb_chunk_ids = [str(h.get("kb_chunk_id") or "").strip() for h in hits if str(h.get("kb_chunk_id") or "").strip()]
+                    kb_by_chunk_id = {d["chunk_id"]: d for d in kb.get_chunk_details(chunk_ids=kb_chunk_ids)} if kb_chunk_ids else {}
                     for h in hits:
-                        t = (h.get("text") or "").strip()
+                        kb_chunk_id = str(h.get("kb_chunk_id") or "").strip()
+                        t = ""
+                        if kb_chunk_id and kb_chunk_id in kb_by_chunk_id:
+                            t = str(kb_by_chunk_id[kb_chunk_id].get("text") or "").strip()
+                        if not t:
+                            t = str(h.get("text_preview") or "").strip()
                         if len(t) > 360:
                             t = t[:360] + "…"
                         if t:
@@ -1100,8 +1607,15 @@ async def kg_interpret_stream(graph_id: str, request: KGInterpretRequest):
                     mentions = []
                     if max_mentions > 0:
                         hits = store.get_entity_mentions(graph_id=graph_id, entity_uuid=eid, limit=max_mentions)
+                        kb_chunk_ids = [str(h.get("kb_chunk_id") or "").strip() for h in hits if str(h.get("kb_chunk_id") or "").strip()]
+                        kb_by_chunk_id = {d["chunk_id"]: d for d in kb.get_chunk_details(chunk_ids=kb_chunk_ids)} if kb_chunk_ids else {}
                         for h in hits:
-                            t = (h.get("text") or "").strip()
+                            kb_chunk_id = str(h.get("kb_chunk_id") or "").strip()
+                            t = ""
+                            if kb_chunk_id and kb_chunk_id in kb_by_chunk_id:
+                                t = str(kb_by_chunk_id[kb_chunk_id].get("text") or "").strip()
+                            if not t:
+                                t = str(h.get("text_preview") or "").strip()
                             if len(t) > 360:
                                 t = t[:360] + "…"
                             if t:
@@ -1174,6 +1688,46 @@ async def list_conversations():
     return storage.list_conversations()
 
 
+@app.get("/api/projects", response_model=List[Project])
+async def list_projects():
+    return projects_store.list_projects()
+
+
+@app.post("/api/projects", response_model=Project)
+async def create_project(request: ProjectCreateRequest):
+    name = str(request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Project name required")
+    return projects_store.create_project(name=name, description=request.description or "")
+
+
+@app.put("/api/projects/{project_id}", response_model=Project)
+async def update_project(project_id: str, request: ProjectUpdateRequest):
+    try:
+        return projects_store.update_project(project_id, name=request.name, description=request.description)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Project not found")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    pid = (project_id or "").strip()
+    if not pid:
+        raise HTTPException(status_code=400, detail="Project id required")
+    ok = projects_store.delete_project(pid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Project not found")
+    # Unbind conversations referencing this project.
+    for cid in storage.list_conversation_ids_by_project(pid):
+        try:
+            storage.update_conversation_project(cid, "")
+        except Exception:
+            pass
+    return {"ok": True}
+
+
 @app.post("/api/conversations", response_model=Conversation)
 async def create_conversation(request: CreateConversationRequest):
     """Create a new conversation."""
@@ -1192,6 +1746,36 @@ async def get_conversation(conversation_id: str):
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
+
+
+@app.put("/api/conversations/{conversation_id}/archive")
+async def set_conversation_archived(conversation_id: str, request: ConversationArchiveRequest):
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    storage.update_conversation_archived(conversation_id, bool(request.archived))
+    return {"ok": True, "archived": bool(storage.get_conversation(conversation_id).get("archived", False))}
+
+
+@app.put("/api/conversations/{conversation_id}/project")
+async def set_conversation_project(conversation_id: str, request: ConversationProjectRequest):
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    project_id = (request.project_id or "").strip()
+    if project_id and projects_store.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    storage.update_conversation_project(conversation_id, project_id)
+    # Best-effort: when assigning to a project, merge this conversation's KB scope into the project.
+    if project_id:
+        try:
+            conv = storage.get_conversation(conversation_id) or {}
+            ids = conv.get("kb_doc_ids") or []
+            if isinstance(ids, list) and ids:
+                projects_store.add_project_kb_doc_ids(project_id, [str(x).strip() for x in ids if str(x).strip()])
+        except Exception:
+            pass
+    return {"ok": True, "project_id": str(storage.get_conversation(conversation_id).get("project_id") or "")}
 
 
 @app.put("/api/conversations/{conversation_id}/kb/doc_ids")
@@ -1318,6 +1902,14 @@ async def save_conversation_report_to_kb(conversation_id: str):
             storage.update_conversation_kb_doc_ids(conversation_id, list(existing) + [doc_id])
         except Exception:
             pass
+
+    # Bind to project KB scope (best-effort).
+    try:
+        project_id = str(conversation.get("project_id") or "").strip()
+        if project_id:
+            projects_store.add_project_kb_doc_id(project_id, doc_id)
+    except Exception:
+        pass
 
     # Append a new Stage4 message that includes kb_doc_id so the UI can display it.
     try:
@@ -1451,8 +2043,84 @@ async def create_job(request: JobCreateRequest):
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
     payload = request.payload or {}
-    job = job_runner.create_and_enqueue(job_type=job_type, payload=payload, conversation_id=conversation_id)
+    job = job_runner.create_and_enqueue(
+        job_type=job_type,
+        payload=payload,
+        conversation_id=conversation_id,
+        idempotency_key=(request.idempotency_key or "").strip(),
+        max_attempts=int(request.max_attempts or 0),
+        force_new=bool(request.force_new),
+    )
+
+    if conversation_id:
+        msg = storage.make_job_event_message(
+            job_id=job.id,
+            job_type=job.job_type,
+            status=job.status,
+            progress=job.progress,
+            summary=str((job.result or {}).get("summary") or "").strip(),
+            error=job.error,
+            conversation_id=conversation_id,
+        )
+        try:
+            storage.add_job_event_message(conversation_id, message=msg)
+        except Exception:
+            pass
+        _publish_job_event(conversation_id, {"type": "job_update", "job": job.__dict__, "message": msg})
+
     return {"ok": True, "job": job.__dict__}
+
+
+@app.get("/api/jobs/stream")
+async def stream_jobs(conversation_id: str):
+    cid = (conversation_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="conversation_id required")
+
+    async def gen():
+        q: asyncio.Queue = asyncio.Queue(maxsize=100)
+        _job_streams.setdefault(cid, set()).add(q)
+        try:
+            while True:
+                item = await q.get()
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            try:
+                _job_streams.get(cid, set()).discard(q)
+                if cid in _job_streams and not _job_streams[cid]:
+                    _job_streams.pop(cid, None)
+            except Exception:
+                pass
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.get("/api/conversations/{conversation_id}/jobs/stream")
+async def stream_conversation_jobs(conversation_id: str):
+    cid = (conversation_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="conversation_id required")
+
+    async def gen():
+        q: asyncio.Queue = asyncio.Queue(maxsize=100)
+        _job_streams.setdefault(cid, set()).add(q)
+        try:
+            while True:
+                item = await q.get()
+                yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            try:
+                _job_streams.get(cid, set()).discard(q)
+                if cid in _job_streams and not _job_streams[cid]:
+                    _job_streams.pop(cid, None)
+            except Exception:
+                pass
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/jobs/{job_id}")
@@ -1471,7 +2139,7 @@ async def list_jobs(conversation_id: str = "", status: str = "", limit: int = 50
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
-    ok = jobs_store.cancel_job(job_id)
+    ok = job_runner.cancel(job_id)
     if not ok:
         raise HTTPException(status_code=400, detail="Cannot cancel job")
     return {"ok": True}
@@ -1537,16 +2205,24 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
+    # Title is generated on the first *user* message (ignore system/job/event messages).
+    msgs = conversation.get("messages") or []
+    is_first_user_message = not any(isinstance(m, dict) and m.get("role") == "user" for m in msgs)
 
     # Add user message
     storage.add_user_message(conversation_id, request.content)
 
-    # If this is the first message, generate a title
-    if is_first_message:
-        title = await generate_conversation_title(request.content, conversation_id=conversation_id)
-        storage.update_conversation_title(conversation_id, title)
+    # If the user explicitly requests literature search, enqueue a background paper_search job (opt-in).
+    _maybe_autocall_paper_search_from_user_request(request.content, conversation_id)
+
+    # If this is the first user message, generate a title
+    if is_first_user_message:
+        # Best-effort: title generation should not block the conversation flow.
+        try:
+            title = await generate_conversation_title(request.content, conversation_id=conversation_id)
+            storage.update_conversation_title(conversation_id, title)
+        except Exception:
+            pass
 
     # Run the council process (mode-aware)
     mode = str(conversation.get("discussion_mode") or "serious").strip().lower()
@@ -1567,10 +2243,21 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         )
         roundtable = list(lively_out.get("transcript") or [])
         # Reuse stage3/4 generators by synthesizing stage1 from transcript.
-        stage1_results = [
-            {"agent_name": m.get("agent_name") or "Agent", "model": m.get("model") or "", "response": m.get("message") or ""}
-            for m in roundtable
-        ]
+        settings = settings_store.get_settings()
+        stage1_results = []
+        for m in roundtable:
+            msg_text = m.get("message") if isinstance(m, dict) else ""
+            clean_text, tool_requests = _extract_tool_blocks(msg_text)
+            stage1_results.append(
+                {
+                    "agent_id": (m.get("agent_id") or "") if isinstance(m, dict) else "",
+                    "agent_name": (m.get("agent_name") or "Agent") if isinstance(m, dict) else "Agent",
+                    "model": (m.get("model") or "") if isinstance(m, dict) else "",
+                    "response": clean_text,
+                    "tool_requests": tool_requests if settings.enable_agent_auto_tools else [],
+                }
+            )
+        _maybe_autocall_tools_from_stage1(stage1_results, conversation_id)
         stage2_results = []
         fact_check = None
         stage3_result = await stage3_synthesize_final(
@@ -1628,6 +2315,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         for i in range(1, rounds + 1):
             q = request.content if i == 1 else (request.content + "\n\n【上轮报告草稿（用于继续迭代）】\n" + (draft or "") + "\n\n请继续完善并修订。")
             stage1_results = await stage1_collect_responses(q, conversation_id=conversation_id, preprocess=preprocess)
+            _maybe_autocall_tools_from_stage1(stage1_results, conversation_id)
             stage2_results, label_to_agent = await stage2_collect_rankings(q, stage1_results, conversation_id=conversation_id)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_agent)
             roundtable = await stage2b_roundtable(q, stage1_results, stage2_results, conversation_id=conversation_id)
@@ -1696,6 +2384,22 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     }
 
 
+@app.put("/api/conversations/{conversation_id}/title")
+async def set_conversation_title(conversation_id: str, request: ConversationTitleRequest):
+    conversation = storage.get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    title = str(request.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title cannot be empty")
+    if len(title) > 80:
+        title = title[:80].rstrip()
+
+    storage.update_conversation_title(conversation_id, title)
+    return {"ok": True, "title": title}
+
+
 @app.post("/api/conversations/{conversation_id}/message/stream")
 async def send_message_stream(conversation_id: str, request: SendMessageRequest):
     """
@@ -1707,23 +2411,50 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Check if this is the first message
-    is_first_message = len(conversation["messages"]) == 0
+    # Title is generated on the first *user* message (ignore system/job/event messages).
+    msgs = conversation.get("messages") or []
+    is_first_user_message = not any(isinstance(m, dict) and m.get("role") == "user" for m in msgs)
 
     async def event_generator():
         try:
             # Add user message
             storage.add_user_message(conversation_id, request.content)
 
-            # Start title generation in parallel (don't await yet)
-            title_task = None
-            if is_first_message:
-                title_task = asyncio.create_task(generate_conversation_title(request.content, conversation_id=conversation_id))
+            # If the user explicitly requests literature search, enqueue a background paper_search job (opt-in).
+            _maybe_autocall_paper_search_from_user_request(request.content, conversation_id)
+
+            # Start title generation in parallel.
+            # IMPORTANT: persist title from a background task so it still succeeds even if the client disconnects (interrupt).
+            title_future: Optional[asyncio.Future] = None
+            title_sent = False
+            if is_first_user_message:
+                loop = asyncio.get_running_loop()
+                title_future = loop.create_future()
+
+                async def _title_worker():
+                    try:
+                        title = await generate_conversation_title(request.content, conversation_id=conversation_id)
+                        storage.update_conversation_title(conversation_id, title)
+                        if title_future and not title_future.done():
+                            title_future.set_result(title)
+                    except Exception as e:
+                        if title_future and not title_future.done():
+                            title_future.set_exception(e)
+
+                asyncio.create_task(_title_worker())
 
             # Stage 0: Preprocess (optional)
             yield f"data: {json.dumps({'type': 'stage0_start'})}\n\n"
             preprocess = await stage0_preprocess(request.content, conversation_id)
             yield f"data: {json.dumps({'type': 'stage0_complete', 'data': preprocess})}\n\n"
+            if title_future and not title_sent and title_future.done():
+                try:
+                    title = title_future.result()
+                    if title:
+                        title_sent = True
+                        yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
+                except Exception:
+                    pass
 
             # Mode-aware discussion
             conv_now = storage.get_conversation(conversation_id) or {}
@@ -1758,17 +2489,42 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 aggregate_rankings = {}
                 yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_agent': label_to_agent, 'aggregate_rankings': aggregate_rankings}, 'mode': 'lively'})}\n\n"
 
-                # Stage 2B: lively transcript
+                # Stage 2B: lively transcript (stream per-message)
                 yield f"data: {json.dumps({'type': 'stage2b_start', 'mode': 'lively'})}\n\n"
-                lively_out = await stage2b_lively(
-                    user_query=request.content,
-                    conversation_id=conversation_id,
-                    initial_script=lively_script,
-                    max_messages=lively_max_messages,
-                    max_turns=lively_max_turns,
+
+                stage2b_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+
+                def _emit_stage2b(m):
+                    try:
+                        stage2b_queue.put_nowait(m)
+                    except Exception:
+                        pass
+
+                lively_task = asyncio.create_task(
+                    stage2b_lively(
+                        user_query=request.content,
+                        conversation_id=conversation_id,
+                        initial_script=lively_script,
+                        max_messages=lively_max_messages,
+                        max_turns=lively_max_turns,
+                        emit=_emit_stage2b,
+                    )
                 )
+
+                while True:
+                    try:
+                        item = await asyncio.wait_for(stage2b_queue.get(), timeout=0.35)
+                        yield f"data: {json.dumps({'type': 'stage2b_message', 'data': item, 'mode': 'lively'}, ensure_ascii=False)}\n\n"
+                    except asyncio.TimeoutError:
+                        if lively_task.done():
+                            break
+                    except Exception:
+                        if lively_task.done():
+                            break
+
+                lively_out = await lively_task
                 roundtable = list(lively_out.get("transcript") or [])
-                yield f"data: {json.dumps({'type': 'stage2b_complete', 'data': roundtable, 'mode': 'lively', 'metadata': {'lively': lively_out}})}\n\n"
+                yield f"data: {json.dumps({'type': 'stage2b_complete', 'data': roundtable, 'mode': 'lively', 'metadata': {'lively': lively_out}}, ensure_ascii=False)}\n\n"
 
                 # Persist script updates (best-effort)
                 final_script = str(lively_out.get("script") or lively_script).strip().lower()
@@ -1784,10 +2540,21 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 yield f"data: {json.dumps({'type': 'stage2c_complete', 'data': fact_check, 'mode': 'lively'})}\n\n"
 
                 # Synthesize stage1 from transcript for chairman summary/report
-                stage1_results = [
-                    {"agent_name": m.get("agent_name") or "Agent", "model": m.get("model") or "", "response": m.get("message") or ""}
-                    for m in roundtable
-                ]
+                settings = settings_store.get_settings()
+                stage1_results = []
+                for m in roundtable:
+                    msg_text = m.get("message") if isinstance(m, dict) else ""
+                    clean_text, tool_requests = _extract_tool_blocks(msg_text)
+                    stage1_results.append(
+                        {
+                            "agent_id": (m.get("agent_id") or "") if isinstance(m, dict) else "",
+                            "agent_name": (m.get("agent_name") or "Agent") if isinstance(m, dict) else "Agent",
+                            "model": (m.get("model") or "") if isinstance(m, dict) else "",
+                            "response": clean_text,
+                            "tool_requests": tool_requests if settings.enable_agent_auto_tools else [],
+                        }
+                    )
+                _maybe_autocall_tools_from_stage1(stage1_results, conversation_id)
 
                 yield f"data: {json.dumps({'type': 'stage3_start', 'mode': 'lively'})}\n\n"
                 stage3_result = await stage3_synthesize_final(
@@ -1833,6 +2600,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
                     yield f"data: {json.dumps({'type': 'stage1_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
                     stage1_results = await stage1_collect_responses(q, conversation_id=conversation_id, preprocess=preprocess)
+                    _maybe_autocall_tools_from_stage1(stage1_results, conversation_id)
                     yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results, 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
 
                     yield f"data: {json.dumps({'type': 'stage2_start', 'mode': 'serious', 'iteration': it, 'iterations': rounds})}\n\n"
@@ -1886,11 +2654,15 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                     "serious_iterations": iterations_meta,
                 }
 
-            # Wait for title generation if it was started
-            if title_task:
-                title = await title_task
-                storage.update_conversation_title(conversation_id, title)
-                yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
+            # Best-effort: emit title event before completion if it's ready.
+            if title_future and not title_sent:
+                try:
+                    title = await asyncio.wait_for(asyncio.shield(title_future), timeout=0.8)
+                    if title:
+                        title_sent = True
+                        yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
+                except Exception:
+                    pass
 
             # Save complete assistant message
             storage.add_assistant_message(
@@ -1920,6 +2692,13 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             "Connection": "keep-alive",
         }
     )
+
+
+# Optional: serve built frontend (Vite dist) from backend to avoid a long-running Node dev server.
+_frontend_dist = Path(PROJECT_ROOT) / "frontend" / "dist"
+if _frontend_dist.exists():
+    # Must be added after API routes so /api/* keeps precedence.
+    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="frontend")
 
 
 if __name__ == "__main__":

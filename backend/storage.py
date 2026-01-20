@@ -37,6 +37,8 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
         "id": conversation_id,
         "created_at": datetime.utcnow().isoformat(),
         "title": "New Conversation",
+        "archived": False,
+        "project_id": "",
         "agent_ids": None,
         "chairman_model": "",
         "chairman_agent_id": "",
@@ -85,6 +87,10 @@ def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
 
     # Backwards compatible defaults for older conversation files.
     if isinstance(conv, dict):
+        if "archived" not in conv or conv.get("archived") is None:
+            conv["archived"] = False
+        if "project_id" not in conv or conv.get("project_id") is None:
+            conv["project_id"] = ""
         if "chairman_model" not in conv or conv.get("chairman_model") is None:
             conv["chairman_model"] = ""
         if "chairman_agent_id" not in conv or conv.get("chairman_agent_id") is None:
@@ -144,6 +150,8 @@ def list_conversations() -> List[Dict[str, Any]]:
                 "created_at": data["created_at"],
                 "title": data.get("title", "New Conversation"),
                 "message_count": len(data["messages"]),
+                "archived": bool(data.get("archived", False)),
+                "project_id": str(data.get("project_id") or ""),
             }
         )
 
@@ -238,6 +246,41 @@ def update_conversation_title(conversation_id: str, title: str):
     save_conversation(conversation)
 
 
+def update_conversation_archived(conversation_id: str, archived: bool) -> None:
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+    conversation["archived"] = bool(archived)
+    save_conversation(conversation)
+
+
+def update_conversation_project(conversation_id: str, project_id: str) -> None:
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+    conversation["project_id"] = str(project_id or "").strip()
+    save_conversation(conversation)
+
+
+def list_conversation_ids_by_project(project_id: str) -> List[str]:
+    pid = str(project_id or "").strip()
+    if not pid:
+        return []
+    ensure_data_dir()
+    out: List[str] = []
+    for path in DATA_DIR_PATH.glob("*.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if str(data.get("project_id") or "").strip() == pid:
+            cid = str(data.get("id") or "").strip()
+            if cid:
+                out.append(cid)
+    return out
+
+
 def add_direct_assistant_message(
     conversation_id: str,
     *,
@@ -260,6 +303,57 @@ def add_direct_assistant_message(
             },
         }
     )
+    save_conversation(conversation)
+
+
+def make_job_event_message(
+    *,
+    job_id: str,
+    job_type: str,
+    status: str,
+    progress: float = 0.0,
+    summary: str = "",
+    error: str = "",
+    kb_doc_id: str = "",
+    conversation_id: str = "",
+) -> Dict[str, Any]:
+    status = str(status or "").strip().lower()
+    title = f"后台任务：{job_type}"
+    meta = {
+        "type": "job_event",
+        "job_id": job_id,
+        "job_type": job_type,
+        "status": status,
+        "progress": float(progress or 0.0),
+        "conversation_id": conversation_id or "",
+    }
+
+    lines = [f"**{title}**", f"- job_id: `{job_id}`", f"- 状态: `{status}`"]
+    if status in ("running", "queued") and progress:
+        lines.append(f"- 进度: `{progress:.0%}`")
+    if kb_doc_id:
+        lines.append(f"- 已入库: `KB[{kb_doc_id}]`")
+    if summary:
+        lines.append("\n**摘要**\n" + summary.strip())
+    if error:
+        lines.append("\n**错误**\n" + str(error).strip())
+
+    return {
+        "role": "assistant",
+        "event": {
+            **meta,
+            "title": title,
+            "content": "\n".join(lines).strip(),
+        },
+        "metadata": meta,
+    }
+
+
+def add_job_event_message(conversation_id: str, *, message: Dict[str, Any]) -> None:
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+    conversation["messages"].append(message)
     save_conversation(conversation)
 
 

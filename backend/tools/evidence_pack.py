@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .. import storage
+from .. import projects_store
 from ..jobs_store import Job
 from ..tool_context import ToolContext
 from ..web_search import ddg_search
 
 
 async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
+    ctx.check_job_cancelled(job.id)
     payload = job.payload or {}
     query = str(payload.get("query") or "").strip()
     if not query:
@@ -19,6 +21,12 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
     if conversation_id:
         conv = storage.get_conversation(conversation_id) or {}
         ids = conv.get("kb_doc_ids") or []
+        project_id = str(conv.get("project_id") or "").strip()
+        if project_id:
+            project = projects_store.get_project(project_id) or {}
+            proj_ids = project.get("kb_doc_ids") if isinstance(project, dict) else []
+            if isinstance(proj_ids, list) and proj_ids:
+                ids = list(ids) + list(proj_ids)
         if isinstance(ids, list) and ids:
             doc_ids = [str(x).strip() for x in ids if str(x).strip()]
 
@@ -27,6 +35,7 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
 
     update_progress(0.05)
     web_results = await ddg_search(query, max_results=max_web) if max_web > 0 else []
+    ctx.check_job_cancelled(job.id)
     update_progress(0.45)
 
     # KB evidence: stable FTS-only (no embeddings/rerank) for speed and determinism.
@@ -61,4 +70,3 @@ async def run(job: Job, ctx: ToolContext, update_progress) -> Dict[str, Any]:
         "kb": kb,
         "scoped_doc_ids": doc_ids or [],
     }
-

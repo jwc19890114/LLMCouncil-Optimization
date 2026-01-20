@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+import heapq
+import json
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .kb_store import KBStore
+from .cache_utils import TTLCache
 from .llm_client import embed_texts
 from .rerank import rerank
 
@@ -35,6 +38,8 @@ def _fts_quality(score: float) -> float:
 class KBHybridRetriever:
     def __init__(self, kb: KBStore):
         self.kb = kb
+        self._query_embedding_cache: TTLCache[tuple[str, str], List[float]] = TTLCache(capacity=256, ttl_seconds=3600.0)
+        self._search_cache: TTLCache[str, List[Dict[str, Any]]] = TTLCache(capacity=256, ttl_seconds=90.0)
 
     async def _semantic_search(
         self,
@@ -47,61 +52,86 @@ class KBHybridRetriever:
         pool: int,
         top_k: int,
     ) -> List[Dict[str, Any]]:
-        chunks = self.kb.list_chunks(agent_id=agent_id, doc_ids=doc_ids, categories=categories, limit=pool)
+        pool = max(0, int(pool))
+        top_k = max(1, int(top_k))
+        chunks = self.kb.list_chunks(
+            agent_id=agent_id,
+            doc_ids=doc_ids,
+            categories=categories,
+            limit=pool,
+            include_text=False,
+        )
         if not chunks:
             return []
 
-        qvecs = await embed_texts(embedding_model_spec, [query], silent=True)
-        if not qvecs or not qvecs[0]:
-            return []
-        qvec = qvecs[0]
+        q_cache_key = (embedding_model_spec, query)
+        qvec = self._query_embedding_cache.get(q_cache_key)
+        if not qvec:
+            qvecs = await embed_texts(embedding_model_spec, [query], silent=True)
+            if not qvecs or not qvecs[0]:
+                return []
+            qvec = qvecs[0]
+            if isinstance(qvec, list) and qvec:
+                self._query_embedding_cache.set(q_cache_key, qvec)
 
-        chunk_ids = [c["chunk_id"] for c in chunks]
-        existing = self.kb.get_chunk_embeddings(chunk_ids=chunk_ids, model_spec=embedding_model_spec)
-        missing = [cid for cid in chunk_ids if cid not in existing]
+        meta_by_id = {c["chunk_id"]: c for c in chunks if c.get("chunk_id")}
+        chunk_ids = list(meta_by_id.keys())
 
-        # Best-effort: fill missing embeddings in batches.
-        if missing:
-            id_to_text = {c["chunk_id"]: (c.get("text") or "") for c in chunks}
-            batch_size = 32
-            new_items: Dict[str, List[float]] = {}
-            for i in range(0, len(missing), batch_size):
-                batch_ids = missing[i : i + batch_size]
-                batch_texts = [id_to_text.get(cid, "") for cid in batch_ids]
-                vecs = await embed_texts(embedding_model_spec, batch_texts, silent=True)
-                if not vecs or len(vecs) != len(batch_ids):
+        # Stream-scoring: compute cosine in batches and only keep top-K heap.
+        heap: List[Tuple[float, str]] = []  # (score, chunk_id) min-heap
+        batch_size = 128
+        for i in range(0, len(chunk_ids), batch_size):
+            batch_ids = chunk_ids[i : i + batch_size]
+            embeddings = self.kb.get_chunk_embeddings(chunk_ids=batch_ids, model_spec=embedding_model_spec)
+            missing = [cid for cid in batch_ids if cid not in embeddings]
+
+            # Best-effort: fill missing embeddings (small batches) to improve recall.
+            if missing:
+                texts = self.kb.get_chunk_texts(chunk_ids=missing)
+                text_list = [texts.get(cid, "") for cid in missing]
+                vecs = await embed_texts(embedding_model_spec, text_list, silent=True)
+                if vecs and len(vecs) == len(missing):
+                    new_items: Dict[str, List[float]] = {}
+                    for cid, v in zip(missing, vecs):
+                        if isinstance(v, list) and v:
+                            new_items[cid] = v
+                    if new_items:
+                        self.kb.set_chunk_embeddings(items=new_items, model_spec=embedding_model_spec)
+                        embeddings.update(new_items)
+
+            for cid, v in embeddings.items():
+                if not v:
                     continue
-                for cid, v in zip(batch_ids, vecs):
-                    if isinstance(v, list) and v:
-                        new_items[cid] = v
-            if new_items:
-                self.kb.set_chunk_embeddings(items=new_items, model_spec=embedding_model_spec)
-                existing.update(new_items)
+                score = _cosine(qvec, v)
+                if len(heap) < top_k:
+                    heapq.heappush(heap, (score, cid))
+                else:
+                    if score > heap[0][0]:
+                        heapq.heapreplace(heap, (score, cid))
 
-        scored: List[Tuple[str, float]] = []
-        for cid in chunk_ids:
-            v = existing.get(cid)
-            if not v:
-                continue
-            scored.append((cid, _cosine(qvec, v)))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top = {cid for cid, _ in scored[:top_k]}
-        score_map = {cid: s for cid, s in scored[:top_k]}
+        if not heap:
+            return []
 
+        scored = sorted(heap, key=lambda x: x[0], reverse=True)
+        top_ids = [cid for _, cid in scored]
+        score_map = {cid: float(score) for score, cid in scored}
+
+        details = self.kb.get_chunk_details(chunk_ids=top_ids)
         out: List[Dict[str, Any]] = []
-        for c in chunks:
-            if c["chunk_id"] not in top:
+        for d in details:
+            cid = d.get("chunk_id")
+            if not cid:
                 continue
             out.append(
                 {
-                    "chunk_id": c["chunk_id"],
-                    "doc_id": c["doc_id"],
-                    "semantic_score": score_map.get(c["chunk_id"], 0.0),
-                    "text": c.get("text") or "",
-                    "title": c.get("title") or "",
-                    "source": c.get("source") or "",
-                    "categories": c.get("categories") or [],
-                    "agent_ids": c.get("agent_ids") or [],
+                    "chunk_id": cid,
+                    "doc_id": d.get("doc_id"),
+                    "semantic_score": score_map.get(cid, 0.0),
+                    "text": d.get("text") or "",
+                    "title": d.get("title") or "",
+                    "source": d.get("source") or "",
+                    "categories": d.get("categories") or [],
+                    "agent_ids": d.get("agent_ids") or [],
                 }
             )
         out.sort(key=lambda x: x.get("semantic_score", 0.0), reverse=True)
@@ -129,6 +159,35 @@ class KBHybridRetriever:
         mode = (mode or "hybrid").strip().lower()
         limit = max(1, min(50, int(limit)))
         initial_k = max(limit, int(initial_k or max(limit * 4, 24)))
+
+        # Short TTL cache to reduce repeated work (embedding/rerank) in chat UIs.
+        # Include kb revision so writes invalidate the cache in-process.
+        try:
+            cache_key = json.dumps(
+                {
+                    "rev": int(getattr(self.kb, "revision", 0)),
+                    "q": query,
+                    "agent_id": agent_id or "",
+                    "doc_ids": doc_ids or [],
+                    "categories": categories or [],
+                    "limit": limit,
+                    "mode": mode,
+                    "embedding_model_spec": embedding_model_spec or "",
+                    "enable_rerank": bool(enable_rerank),
+                    "rerank_model_spec": rerank_model_spec or "",
+                    "semantic_pool": int(semantic_pool),
+                    "initial_k": int(initial_k),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            cache_key = ""
+        if cache_key:
+            cached = self._search_cache.get(cache_key)
+            if cached is not None:
+                return [dict(x) for x in cached]
 
         fts_hits: List[Dict[str, Any]] = []
         sem_hits: List[Dict[str, Any]] = []
@@ -212,6 +271,8 @@ class KBHybridRetriever:
                     item["rerank_score"] = score
                     item["retrieval"] = sorted(list(item.get("retrieval") or []))
                     out.append(item)
+                if cache_key:
+                    self._search_cache.set(cache_key, [dict(x) for x in out])
                 return out
 
         # Fallback: heuristic top-N
@@ -220,6 +281,8 @@ class KBHybridRetriever:
             item = dict(item)
             item["retrieval"] = sorted(list(item.get("retrieval") or []))
             out.append(item)
+        if cache_key:
+            self._search_cache.set(cache_key, [dict(x) for x in out])
         return out
 
     async def index_embeddings(
@@ -230,32 +293,48 @@ class KBHybridRetriever:
         doc_ids: Optional[List[str]] = None,
         categories: Optional[List[str]] = None,
         pool: int = 5000,
+        check_cancelled: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         if not embedding_model_spec:
             return {"ok": False, "error": "KB_EMBEDDING_MODEL 未配置"}
 
-        chunks = self.kb.list_chunks(agent_id=agent_id, doc_ids=doc_ids, categories=categories, limit=pool)
-        chunk_ids = [c["chunk_id"] for c in chunks]
-        existing = self.kb.get_chunk_embeddings(chunk_ids=chunk_ids, model_spec=embedding_model_spec)
-        missing = [cid for cid in chunk_ids if cid not in existing]
-        if not missing:
-            return {"ok": True, "indexed": 0, "total": len(chunk_ids)}
+        pool = max(0, int(pool))
+        chunks = self.kb.list_chunks(
+            agent_id=agent_id,
+            doc_ids=doc_ids,
+            categories=categories,
+            limit=pool,
+            include_text=False,
+        )
+        chunk_ids = [c["chunk_id"] for c in chunks if c.get("chunk_id")]
 
-        id_to_text = {c["chunk_id"]: (c.get("text") or "") for c in chunks}
-        batch_size = 32
+        batch_size = 128
+        embed_batch = 32
         indexed = 0
-        for i in range(0, len(missing), batch_size):
-            batch_ids = missing[i : i + batch_size]
-            batch_texts = [id_to_text.get(cid, "") for cid in batch_ids]
-            vecs = await embed_texts(embedding_model_spec, batch_texts)
-            if not vecs or len(vecs) != len(batch_ids):
+        for i in range(0, len(chunk_ids), batch_size):
+            if check_cancelled:
+                check_cancelled()
+            batch_ids = chunk_ids[i : i + batch_size]
+            existing = self.kb.get_chunk_embeddings(chunk_ids=batch_ids, model_spec=embedding_model_spec)
+            missing = [cid for cid in batch_ids if cid not in existing]
+            if not missing:
                 continue
-            items: Dict[str, List[float]] = {}
-            for cid, v in zip(batch_ids, vecs):
-                if isinstance(v, list) and v:
-                    items[cid] = v
-            if items:
-                self.kb.set_chunk_embeddings(items=items, model_spec=embedding_model_spec)
-                indexed += len(items)
+
+            texts = self.kb.get_chunk_texts(chunk_ids=missing)
+            for j in range(0, len(missing), embed_batch):
+                if check_cancelled:
+                    check_cancelled()
+                part_ids = missing[j : j + embed_batch]
+                part_texts = [texts.get(cid, "") for cid in part_ids]
+                vecs = await embed_texts(embedding_model_spec, part_texts)
+                if not vecs or len(vecs) != len(part_ids):
+                    continue
+                items: Dict[str, List[float]] = {}
+                for cid, v in zip(part_ids, vecs):
+                    if isinstance(v, list) and v:
+                        items[cid] = v
+                if items:
+                    self.kb.set_chunk_embeddings(items=items, model_spec=embedding_model_spec)
+                    indexed += len(items)
 
         return {"ok": True, "indexed": indexed, "total": len(chunk_ids)}

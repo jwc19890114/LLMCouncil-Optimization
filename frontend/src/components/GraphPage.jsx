@@ -42,8 +42,24 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
   const [extractDocId, setExtractDocId] = useState('');
   const [extractText, setExtractText] = useState('');
   const [extractCategories, setExtractCategories] = useState([]);
+  const [extractAgentId, setExtractAgentId] = useState(() => {
+    try {
+      return localStorage.getItem('kg:extractAgentId') || '';
+    } catch {
+      return '';
+    }
+  });
+  const [extractAsyncJob, setExtractAsyncJob] = useState(() => {
+    try {
+      return (localStorage.getItem('kg:extractAsyncJob') || '1') === '1';
+    } catch {
+      return true;
+    }
+  });
   const [extractInfo, setExtractInfo] = useState('');
   const [extractProgress, setExtractProgress] = useState(null);
+  const [kgJobs, setKgJobs] = useState([]);
+  const [kgJobsError, setKgJobsError] = useState('');
 
   const [interpretMode, setInterpretMode] = useState('both'); // nodes | communities | both
   const [interpretProgress, setInterpretProgress] = useState(null);
@@ -83,6 +99,22 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
   }, [leftPanelWidth]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem('kg:extractAgentId', String(extractAgentId || ''));
+    } catch {
+      return;
+    }
+  }, [extractAgentId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('kg:extractAsyncJob', extractAsyncJob ? '1' : '0');
+    } catch {
+      return;
+    }
+  }, [extractAsyncJob]);
+
+  useEffect(() => {
     function clampWidth(w) {
       const min = 280;
       const max = Math.max(min, Math.min(820, window.innerWidth - 360));
@@ -111,6 +143,12 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
   }, []);
 
   const enabledAgents = useMemo(() => agents.filter((a) => a.enabled), [agents]);
+  const extractModelSpec = useMemo(() => {
+    const id = String(extractAgentId || '').trim();
+    if (!id) return null;
+    const a = enabledAgents.find((x) => x?.id === id);
+    return a?.model_spec ? String(a.model_spec) : null;
+  }, [enabledAgents, extractAgentId]);
   const availableCategories = useMemo(() => {
     const set = new Set();
     for (const d of kbDocs || []) {
@@ -127,12 +165,12 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
       if (!o?.graph_id) continue;
       map.set(o.graph_id, {
         graph_id: o.graph_id,
-        label: `${o.agent_name || '专家'} · ${o.graph_id}`,
+        // Initial options come from "bound agents"; use a neutral label and let the server graph list override if available.
+        label: `图谱 · ${o.graph_id}`,
       });
     }
     for (const g of graphs || []) {
       if (!g?.graph_id) continue;
-      if (map.has(g.graph_id)) continue;
       const name = g.name || '图谱';
       map.set(g.graph_id, { graph_id: g.graph_id, label: `${name} · ${g.graph_id}` });
     }
@@ -145,9 +183,55 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
     setGraphs(g?.graphs || []);
     setAgents(a || []);
     setKbDocs(d?.documents || []);
+    try {
+      setKgJobsError('');
+      const j = await api.listJobs({ limit: 80 });
+      setKgJobs(Array.isArray(j?.jobs) ? j.jobs : []);
+    } catch (e) {
+      setKgJobsError(e?.message || '加载任务列表失败');
+      setKgJobs([]);
+    }
     const first = initialOptions[0]?.graph_id || g?.graphs?.[0]?.graph_id || '';
     if (first) setGraphId(first);
   }
+
+  async function reloadKgJobs() {
+    try {
+      setKgJobsError('');
+      const j = await api.listJobs({ limit: 80 });
+      setKgJobs(Array.isArray(j?.jobs) ? j.jobs : []);
+    } catch (e) {
+      setKgJobsError(e?.message || '加载任务列表失败');
+    }
+  }
+
+  const kgJobsForGraph = useMemo(() => {
+    const gid = String(graphId || '').trim();
+    const list = Array.isArray(kgJobs) ? kgJobs : [];
+    const filtered = list.filter((j) => {
+      if (!j || j.job_type !== 'kg_extract') return false;
+      const pgid = String(j?.payload?.graph_id || j?.result?.graph_id || '').trim();
+      return gid ? pgid === gid : true;
+    });
+    const order = (x) => {
+      const raw = String(x?.updated_at || x?.created_at || '');
+      const t = Date.parse(raw);
+      return Number.isFinite(t) ? t : 0;
+    };
+    return filtered.sort((a, b) => order(b) - order(a)).slice(0, 10);
+  }, [graphId, kgJobs]);
+
+  const formatDate = useCallback((iso) => {
+    const raw = String(iso || '').trim();
+    if (!raw) return '';
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return raw;
+    try {
+      return new Date(t).toLocaleString();
+    } catch {
+      return raw;
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -360,6 +444,7 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
     cancelExtractRef.current = false;
     setIsLoading(true);
     try {
+      const model_spec = extractModelSpec || null;
       if (extractMode === 'doc') {
         const docId = (extractDocId || '').trim();
         if (!docId) {
@@ -367,19 +452,22 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
           setIsLoading(false);
           return;
         }
-        const d = await api.getKBDocument(docId);
-        const text = d?.document?.text || '';
-        if (!text.trim()) {
-          setError('该文档没有可抽取的内容');
-          setIsLoading(false);
-          return;
+        const meta = (kbDocs || []).find((d) => d.id === docId);
+        const title = meta?.title || docId;
+        if (extractAsyncJob) {
+          setExtractProgress({ mode: 'doc', total: 1, done: 0, entities: 0, relations: 0, current: title });
+          const r = await api.extractKG({ graph_id: graphId, kb_doc_id: docId, model_spec, async_job: true });
+          setExtractProgress({ mode: 'doc', total: 1, done: 1, entities: 0, relations: 0, current: title });
+          setExtractInfo(`已加入后台抽取队列：job_id=${r?.job?.id || ''}（可切换页面，完成后回到图谱点“刷新”）`);
+          await reloadKgJobs();
+        } else {
+          setExtractProgress({ mode: 'doc', total: 1, done: 0, entities: 0, relations: 0, current: title });
+          const r = await api.extractKG({ graph_id: graphId, kb_doc_id: docId, model_spec });
+          const entities = r?.entities ?? 0;
+          const relations = r?.relations ?? 0;
+          setExtractProgress({ mode: 'doc', total: 1, done: 1, entities, relations, current: title });
+          setExtractInfo(`抽取完成：实体 ${entities}，关系 ${relations}`);
         }
-        setExtractProgress({ mode: 'doc', total: 1, done: 0, entities: 0, relations: 0, current: d?.document?.title || docId });
-        const r = await api.extractKG({ graph_id: graphId, text });
-        const entities = r?.entities ?? 0;
-        const relations = r?.relations ?? 0;
-        setExtractProgress({ mode: 'doc', total: 1, done: 1, entities, relations, current: d?.document?.title || docId });
-        setExtractInfo(`抽取完成：实体 ${entities}，关系 ${relations}`);
       } else if (extractMode === 'text') {
         const text = extractText || '';
         if (!text.trim()) {
@@ -387,12 +475,20 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
           setIsLoading(false);
           return;
         }
-        setExtractProgress({ mode: 'text', total: 1, done: 0, entities: 0, relations: 0, current: '粘贴文本' });
-        const r = await api.extractKG({ graph_id: graphId, text });
-        const entities = r?.entities ?? 0;
-        const relations = r?.relations ?? 0;
-        setExtractProgress({ mode: 'text', total: 1, done: 1, entities, relations, current: '粘贴文本' });
-        setExtractInfo(`抽取完成：实体 ${entities}，关系 ${relations}`);
+        if (extractAsyncJob) {
+          setExtractProgress({ mode: 'text', total: 1, done: 0, entities: 0, relations: 0, current: '粘贴文本' });
+          const r = await api.extractKG({ graph_id: graphId, text, model_spec, async_job: true });
+          setExtractProgress({ mode: 'text', total: 1, done: 1, entities: 0, relations: 0, current: '粘贴文本' });
+          setExtractInfo(`已加入后台抽取队列：job_id=${r?.job?.id || ''}（完成后回到图谱点“刷新”）`);
+          await reloadKgJobs();
+        } else {
+          setExtractProgress({ mode: 'text', total: 1, done: 0, entities: 0, relations: 0, current: '粘贴文本' });
+          const r = await api.extractKG({ graph_id: graphId, text, model_spec });
+          const entities = r?.entities ?? 0;
+          const relations = r?.relations ?? 0;
+          setExtractProgress({ mode: 'text', total: 1, done: 1, entities, relations, current: '粘贴文本' });
+          setExtractInfo(`抽取完成：实体 ${entities}，关系 ${relations}`);
+        }
       } else {
         const cats = Array.isArray(extractCategories) ? extractCategories.filter(Boolean) : [];
         if (cats.length === 0) {
@@ -428,16 +524,21 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
             ...(p || {}),
             current: meta?.title ? `文档：${meta.title}` : `文档：${docId}`,
           }));
-          const d = await api.getKBDocument(docId);
-          const text = d?.document?.text || '';
-          if (!text.trim()) {
-            done += 1;
-            setExtractProgress({ mode: 'category', total: docIds.length, done, entities: totalEntities, relations: totalRelations, current: meta?.title || docId });
-            continue;
+          if (extractAsyncJob) {
+            try {
+              await api.extractKG({ graph_id: graphId, kb_doc_id: docId, model_spec, async_job: true });
+            } catch {
+              // ignore per-doc enqueue errors
+            }
+          } else {
+            try {
+              const r = await api.extractKG({ graph_id: graphId, kb_doc_id: docId, model_spec });
+              totalEntities += r?.entities ?? 0;
+              totalRelations += r?.relations ?? 0;
+            } catch {
+              // ignore per-doc errors
+            }
           }
-          const r = await api.extractKG({ graph_id: graphId, text });
-          totalEntities += r?.entities ?? 0;
-          totalRelations += r?.relations ?? 0;
           done += 1;
           setExtractProgress({
             mode: 'category',
@@ -450,15 +551,26 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
         }
 
         if (cancelExtractRef.current) {
-          setExtractInfo(`已停止：已处理 ${done}/${docIds.length} 篇文档，累计实体 ${totalEntities}，关系 ${totalRelations}`);
+          setExtractInfo(
+            extractAsyncJob
+              ? `已停止入队：已处理 ${done}/${docIds.length} 篇文档（后台任务会继续执行已入队部分）。`
+              : `已停止：已处理 ${done}/${docIds.length} 篇文档，累计实体 ${totalEntities}，关系 ${totalRelations}`
+          );
         } else {
-          setExtractInfo(`抽取完成：共 ${docIds.length} 篇文档，累计实体 ${totalEntities}，关系 ${totalRelations}`);
+          setExtractInfo(
+            extractAsyncJob
+              ? `已全部加入后台抽取队列：共 ${docIds.length} 篇文档（可切换页面，完成后回到图谱点“刷新”）`
+              : `抽取完成：共 ${docIds.length} 篇文档，累计实体 ${totalEntities}，关系 ${totalRelations}`
+          );
+          if (extractAsyncJob) await reloadKgJobs();
         }
       }
 
-      const g = await api.getKGGraph(graphId);
-      setCommunitySummaries(g?.community_summaries?.summaries || []);
-      await renderGraphData(g);
+      if (!extractAsyncJob) {
+        const g = await api.getKGGraph(graphId);
+        setCommunitySummaries(g?.community_summaries?.summaries || []);
+        await renderGraphData(g);
+      }
     } catch (e) {
       setError(e?.message || '抽取失败（请检查 Neo4j 配置/模型可用性）');
     } finally {
@@ -619,6 +731,26 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
                 <option value="category">按分类批量抽取</option>
                 <option value="text">从粘贴文本抽取</option>
               </select>
+              <div className="grow">
+                <select
+                  className="ginput"
+                  value={extractAgentId}
+                  onChange={(e) => setExtractAgentId(e.target.value)}
+                  title="选择用于图谱抽取的模型/专家"
+                >
+                  <option value="">默认（主席模型）</option>
+                  {enabledAgents.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name} · {a.model_spec}
+                    </option>
+                  ))}
+                </select>
+                <label className="gcheck" title="后台执行：抽取会进入 Jobs 队列，可切换页面，完成后再刷新图谱">
+                  <input type="checkbox" checked={extractAsyncJob} onChange={(e) => setExtractAsyncJob(e.target.checked)} />
+                  <span>后台执行</span>
+                </label>
+              </div>
+              <div className="gpage-hint">建议：图谱抽取用更快/更便宜的模型（专用专家），讨论/写报告再用更强的模型。</div>
               {extractMode === 'doc' ? (
                 <select className="ginput" value={extractDocId} onChange={(e) => setExtractDocId(e.target.value)}>
                   <option value="">（选择文档）</option>
@@ -649,6 +781,59 @@ export default function GraphPage({ onBack, initialGraphOptions }) {
               <button className="gpage-btn primary" onClick={handleExtract} disabled={isLoading || !graphId}>
                 抽取并写入
               </button>
+              {kgJobsError ? <div className="gpage-hint">{kgJobsError}</div> : null}
+              {kgJobsForGraph.length > 0 ? (
+                <div className="gjobs">
+                  <div className="gjobs-title">
+                    后台抽取任务（{kgJobsForGraph.length}）
+                    <button className="gpage-btn secondary" type="button" onClick={reloadKgJobs} disabled={isLoading}>
+                      刷新任务
+                    </button>
+                  </div>
+                  <div className="gjobs-list">
+                    {kgJobsForGraph.map((j) => {
+                      const jid = String(j?.id || '');
+                      const st = String(j?.status || '');
+                      const prog = Math.round(Math.max(0, Math.min(1, Number(j?.progress || 0))) * 100);
+                      const summary = String(j?.result?.summary || j?.error || '').trim();
+                      const ts = formatDate(j?.updated_at || j?.created_at);
+                      const canCancel = st === 'queued' || st === 'running';
+                      return (
+                        <div key={jid} className="gjobs-item">
+                          <div className="gjobs-meta">
+                            <span className={`gjobs-status s-${st}`}>{st}</span>
+                            <span className="gjobs-id" title={jid}>
+                              {jid.slice(0, 10)}…
+                            </span>
+                            {ts ? <span className="gjobs-ts">{ts}</span> : null}
+                            <span className="gjobs-progress">{prog}%</span>
+                          </div>
+                          {summary ? <div className="gjobs-summary">{summary}</div> : null}
+                          {canCancel ? (
+                            <div className="gjobs-actions">
+                              <button
+                                className="gpage-btn secondary"
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    await api.cancelJob(jid);
+                                    await reloadKgJobs();
+                                  } catch (e) {
+                                    setError(e?.message || '取消失败');
+                                  }
+                                }}
+                                disabled={isLoading}
+                              >
+                                取消
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
               {extractProgress && (
                 <div className="gprogress">
                   <div className="gprogress-top">
